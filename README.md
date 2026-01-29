@@ -1,0 +1,2 @@
+# kalshibot
+prediction market bot
