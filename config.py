@@ -36,7 +36,7 @@ MARKET_SERIES = "KXBTC15M"
 
 # Safety thresholds
 MIN_SECONDS_TO_CLOSE = 90
-MAX_SPREAD_CENTS = 5
+MAX_SPREAD_CENTS = 25
 MIN_AGENT_CONFIDENCE = 0.75
 MIN_CONTRACT_PRICE = 5
 
@@ -56,7 +56,7 @@ TUNABLE_FIELDS = {
     "MAX_POSITION_SIZE":    {"type": "int",   "min": 1,  "max": 500},
     "MAX_DAILY_LOSS":       {"type": "float", "min": 1,  "max": 1000},
     "MIN_SECONDS_TO_CLOSE": {"type": "int",   "min": 30, "max": 600},
-    "MAX_SPREAD_CENTS":     {"type": "int",   "min": 1,  "max": 50},
+    "MAX_SPREAD_CENTS":     {"type": "int",   "min": 1,  "max": 100},
     "MIN_AGENT_CONFIDENCE": {"type": "float", "min": 0,  "max": 1},
     "MIN_CONTRACT_PRICE":   {"type": "int",   "min": 1,  "max": 55},
     "POLL_INTERVAL_SECONDS":{"type": "int",   "min": 5,  "max": 120},
