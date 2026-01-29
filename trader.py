@@ -535,7 +535,20 @@ class TradingBot:
                 self.status["last_action"] = "Price too cheap — holding"
                 return
 
-            qty = min(config.ORDER_SIZE, config.MAX_POSITION_SIZE)
+            # Check current position to avoid exceeding MAX_POSITION_SIZE
+            current_qty = 0
+            if my_pos:
+                current_qty = (my_pos.get("yes_quantity", 0) or 0) + (my_pos.get("no_quantity", 0) or 0)
+                if current_qty < 0:
+                    current_qty = my_pos.get("position", 0) or 0
+                    current_qty = abs(current_qty)
+            remaining_capacity = config.MAX_POSITION_SIZE - current_qty
+            if remaining_capacity <= 0:
+                log_event("GUARD", f"Position guard: already at {current_qty}/{config.MAX_POSITION_SIZE} — holding")
+                self.status["last_action"] = f"Max position reached ({current_qty})"
+                return
+
+            qty = min(config.ORDER_SIZE, remaining_capacity)
             order = await self.place_order(ticker, side, price_cents, qty)
             if order:
                 self.status["last_action"] = f"Placed {side.upper()} @ {price_cents}c x{qty}"
