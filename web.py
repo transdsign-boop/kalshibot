@@ -67,6 +67,7 @@ async def api_status():
         "running": bot.status["running"],
         "balance": f"${bot.status['balance']:.2f}",
         "day_pnl": bot.status.get("day_pnl", 0.0),
+        "position_pnl": bot.status.get("position_pnl", 0.0),
         "position": pos_label,
         "market": bot.status.get("current_market") or "—",
         "last_action": bot.status.get("last_action", "Idle"),

@@ -59,14 +59,18 @@
   </div>
 
   <!-- Top Cards -->
-  <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+  <div class="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
     <div class="card p-5">
       <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Balance</p>
       <p id="card-balance" class="text-2xl font-bold">—</p>
     </div>
     <div class="card p-5">
-      <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Day P&amp;L</p>
+      <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Settled P&amp;L</p>
       <p id="card-pnl" class="text-2xl font-bold">—</p>
+    </div>
+    <div class="card p-5">
+      <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Position P&amp;L</p>
+      <p id="card-pos-pnl" class="text-2xl font-bold text-gray-500">—</p>
     </div>
     <div class="card p-5">
       <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Active Position</p>
@@ -223,6 +227,12 @@
         const pnlSign = pnl >= 0 ? '+' : '';
         pnlEl.textContent = pnlSign + '$' + Math.abs(pnl).toFixed(2);
         pnlEl.className = 'text-2xl font-bold ' + (pnl < 0 ? 'text-red-400' : 'text-green-400');
+
+        const posPnlEl = document.getElementById('card-pos-pnl');
+        const posPnl = typeof d.position_pnl === 'number' ? d.position_pnl : parseFloat(d.position_pnl) || 0;
+        const posPnlSign = posPnl >= 0 ? '+' : '';
+        posPnlEl.textContent = posPnlSign + '$' + Math.abs(posPnl).toFixed(2);
+        posPnlEl.className = 'text-2xl font-bold ' + (posPnl === 0 ? 'text-gray-500' : posPnl < 0 ? 'text-red-400' : 'text-green-400');
 
         document.getElementById('card-position').textContent = d.position;
         document.getElementById('card-market').textContent = d.market;

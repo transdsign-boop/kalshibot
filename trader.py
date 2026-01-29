@@ -79,12 +79,14 @@ class TradingBot:
         self.private_key = _load_private_key()
         self._active_env = config.KALSHI_ENV
         self._start_balance: float | None = None  # set on first cycle
+        self._start_exposure: float = 0.0        # open position cost at start
 
         # Live state exposed to the dashboard
         self.status: dict[str, Any] = {
             "running": False,
             "balance": 0.0,
             "day_pnl": 0.0,
+            "position_pnl": 0.0,
             "active_position": None,
             "current_market": None,
             "last_action": "Idle",
@@ -126,6 +128,7 @@ class TradingBot:
         self.status["current_market"] = None
         self.status["cycle_count"] = 0
         self._start_balance = None  # reset so P&L recalculates for new env
+        self._start_exposure = 0.0
         set_setting("env", env)
         log_event("INFO", f"Switched to {env.upper()} environment")
 
@@ -374,13 +377,9 @@ class TradingBot:
         self.status["cycle_count"] += 1
 
         try:
-            # 1. Refresh balance and compute real P&L
+            # 1. Refresh balance
             balance = await self.fetch_balance()
             self.status["balance"] = balance
-            if self._start_balance is None:
-                self._start_balance = balance
-                log_event("INFO", f"Starting balance: ${balance:.2f}")
-            self.status["day_pnl"] = balance - self._start_balance
 
             # 2. Find active market
             market = await self.fetch_active_market()
@@ -393,10 +392,29 @@ class TradingBot:
             ticker = market.get("ticker", "")
             self.status["current_market"] = ticker
 
-            # 3. Positions
+            # 3. Positions + P&L
             positions = await self.fetch_positions()
             my_pos = next((p for p in positions if p.get("ticker") == ticker), None)
             self.status["active_position"] = my_pos
+
+            # Total cost of all open positions (cents → dollars)
+            total_exposure_cents = sum(
+                p.get("market_exposure", 0) or 0 for p in positions
+            )
+            total_exposure = total_exposure_cents / 100.0
+
+            # Capture starting snapshot on first cycle
+            if self._start_balance is None:
+                self._start_balance = balance
+                self._start_exposure = total_exposure
+                log_event("INFO", f"Starting balance: ${balance:.2f}, exposure: ${total_exposure:.2f}")
+
+            # Settled P&L: (balance + exposure) - (start_balance + start_exposure)
+            # Buying a contract moves money from balance→exposure (net zero).
+            # Settlement removes exposure and changes balance by payout (net = profit/loss).
+            self.status["day_pnl"] = (
+                (balance + total_exposure) - (self._start_balance + self._start_exposure)
+            )
 
             # 4. Time guard
             if not self._time_guard(market):
@@ -423,6 +441,22 @@ class TradingBot:
                 "yes_depth": sum(q for _, q in yes_orders),
                 "no_depth": sum(q for _, q in no_orders),
             }
+
+            # Unrealized position P&L (mark-to-market vs cost)
+            if my_pos:
+                pos_qty = my_pos.get("position", 0) or 0
+                pos_exposure_cents = my_pos.get("market_exposure", 0) or 0
+                if pos_qty > 0:
+                    # Long YES: value = best_bid × qty
+                    mark_to_market = best_bid * pos_qty
+                elif pos_qty < 0:
+                    # Long NO: value = (100 - best_ask) × |qty|  (what NO side is worth)
+                    mark_to_market = (100 - best_ask) * abs(pos_qty)
+                else:
+                    mark_to_market = 0
+                self.status["position_pnl"] = (mark_to_market - pos_exposure_cents) / 100.0
+            else:
+                self.status["position_pnl"] = 0.0
 
             if not spread_ok:
                 self.status["last_action"] = "Spread too wide — holding"
