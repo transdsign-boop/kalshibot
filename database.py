@@ -1,9 +1,15 @@
+import os
 import sqlite3
 import json
 from datetime import datetime, timezone
 from contextlib import contextmanager
 
-DB_PATH = "kalshibot.db"
+# Use persistent volume on Fly.io (/data), fall back to local for dev
+_VOLUME_DIR = "/data"
+if os.path.isdir(_VOLUME_DIR):
+    DB_PATH = os.path.join(_VOLUME_DIR, "kalshibot.db")
+else:
+    DB_PATH = "kalshibot.db"
 
 
 def _connect():
