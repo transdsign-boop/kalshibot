@@ -119,10 +119,19 @@
   </div>
 
   <!-- Alpha Engine Cards -->
-  <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+  <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
     <div class="card p-5">
-      <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Binance Lead</p>
-      <p id="card-delta" class="text-2xl font-bold font-mono">--</p>
+      <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Delta Momentum</p>
+      <p id="card-momentum" class="text-2xl font-bold font-mono">--</p>
+      <p class="text-xs text-gray-600 mt-1">
+        Raw: <span id="card-delta-raw" class="font-mono text-gray-400">--</span>
+        <span class="mx-1">|</span>
+        Base: <span id="card-delta-base" class="font-mono text-gray-400">--</span>
+      </p>
+    </div>
+    <div class="card p-5">
+      <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Proj. Settlement</p>
+      <p id="card-settlement" class="text-2xl font-bold font-mono">--</p>
       <p class="text-xs text-gray-600 mt-1">
         <span id="alpha-binance-status" class="inline-block w-2 h-2 rounded-full bg-gray-600 mr-1"></span>Binance
         <span class="mx-2">|</span>
@@ -130,12 +139,17 @@
       </p>
     </div>
     <div class="card p-5">
-      <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Proj. Settlement</p>
-      <p id="card-settlement" class="text-2xl font-bold font-mono">--</p>
-    </div>
-    <div class="card p-5">
       <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Alpha Override</p>
       <p id="card-alpha-override" class="text-lg font-semibold text-gray-500">None</p>
+    </div>
+    <div class="card p-5">
+      <p class="text-xs text-gray-500 uppercase tracking-wide mb-1">Prices</p>
+      <p class="text-sm font-mono">
+        <span class="text-gray-500">BIN</span> <span id="card-binance-price" class="text-gray-300">--</span>
+      </p>
+      <p class="text-sm font-mono">
+        <span class="text-gray-500">CB</span>&nbsp; <span id="card-coinbase-price" class="text-gray-300">--</span>
+      </p>
     </div>
   </div>
 
@@ -306,11 +320,18 @@
 
         // Alpha Engine
         if (d.alpha) {
-          const delta = d.alpha.latency_delta || 0;
-          const deltaEl = document.getElementById('card-delta');
-          const sign = delta >= 0 ? '+' : '';
-          deltaEl.textContent = sign + '$' + Math.abs(delta).toFixed(2);
-          deltaEl.className = 'text-2xl font-bold font-mono ' + (delta >= 0 ? 'text-green-400' : 'text-red-400');
+          const momentum = d.alpha.delta_momentum || 0;
+          const momEl = document.getElementById('card-momentum');
+          const momSign = momentum >= 0 ? '+' : '';
+          momEl.textContent = momSign + '$' + Math.abs(momentum).toFixed(2);
+          momEl.className = 'text-2xl font-bold font-mono ' +
+            (Math.abs(momentum) < 5 ? 'text-gray-400' : momentum >= 0 ? 'text-green-400' : 'text-red-400');
+
+          // Raw delta and baseline for context
+          const rawDelta = d.alpha.latency_delta || 0;
+          const baseline = d.alpha.delta_baseline || 0;
+          document.getElementById('card-delta-raw').textContent = (rawDelta >= 0 ? '+' : '') + '$' + Math.abs(rawDelta).toFixed(2);
+          document.getElementById('card-delta-base').textContent = (baseline >= 0 ? '+' : '') + '$' + Math.abs(baseline).toFixed(2);
 
           const settleEl = document.getElementById('card-settlement');
           const settle = d.alpha.projected_settlement || 0;
@@ -320,6 +341,12 @@
             'inline-block w-2 h-2 rounded-full mr-1 ' + (d.alpha.binance_connected ? 'bg-green-500' : 'bg-red-500');
           document.getElementById('alpha-coinbase-status').className =
             'inline-block w-2 h-2 rounded-full mr-1 ' + (d.alpha.coinbase_connected ? 'bg-green-500' : 'bg-red-500');
+
+          // Prices
+          const bp = d.alpha.binance_price || 0;
+          const cp = d.alpha.coinbase_price || 0;
+          document.getElementById('card-binance-price').textContent = bp > 0 ? '$' + bp.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',') : '--';
+          document.getElementById('card-coinbase-price').textContent = cp > 0 ? '$' + cp.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',') : '--';
         }
 
         const overrideEl = document.getElementById('card-alpha-override');
@@ -466,8 +493,8 @@
       MIN_CONTRACT_PRICE: 'Min Contract Price (cents)',
       STOP_LOSS_CENTS: 'Stop Loss (cents/contract)',
       POLL_INTERVAL_SECONDS: 'Poll Interval (secs)',
-      DELTA_THRESHOLD: 'Delta Threshold ($)',
-      EXTREME_DELTA_THRESHOLD: 'Extreme Delta ($)',
+      DELTA_THRESHOLD: 'Momentum Threshold ($)',
+      EXTREME_DELTA_THRESHOLD: 'Extreme Momentum ($)',
       ANCHOR_SECONDS_THRESHOLD: 'Anchor Secs Threshold',
     };
 

@@ -32,10 +32,17 @@ class AlphaMonitor:
     RECONNECT_MAX_DELAY = 30.0
     RECONNECT_JITTER = 0.5
 
+    DELTA_WINDOW_SECONDS = 60  # rolling window for baseline delta
+
     def __init__(self):
         self.binance_price: float = 0.0
         self.coinbase_price: float = 0.0
         self.latency_delta: float = 0.0
+
+        # Momentum tracking: filters out structural futures premium
+        self._delta_history: list[tuple[float, float]] = []  # (timestamp, delta)
+        self.delta_baseline: float = 0.0   # rolling average delta over window
+        self.delta_momentum: float = 0.0   # current_delta - baseline (the trading signal)
 
         self.binance_connected: bool = False
         self.coinbase_connected: bool = False
@@ -176,6 +183,27 @@ class AlphaMonitor:
         if self.binance_price > 0 and self.coinbase_price > 0:
             self.latency_delta = self.binance_price - self.coinbase_price
 
+            # Record delta and compute momentum (deviation from rolling baseline)
+            now = time.time()
+            self._delta_history.append((now, self.latency_delta))
+
+            # Trim to window
+            cutoff = now - self.DELTA_WINDOW_SECONDS
+            self._delta_history = [
+                (ts, d) for ts, d in self._delta_history if ts >= cutoff
+            ]
+
+            if len(self._delta_history) >= 2:
+                self.delta_baseline = (
+                    sum(d for _, d in self._delta_history)
+                    / len(self._delta_history)
+                )
+                self.delta_momentum = self.latency_delta - self.delta_baseline
+            else:
+                # Not enough data yet — no signal
+                self.delta_baseline = self.latency_delta
+                self.delta_momentum = 0.0
+
     # ------------------------------------------------------------------
     # Settlement projection (BRTI proxy)
     # ------------------------------------------------------------------
@@ -236,6 +264,8 @@ class AlphaMonitor:
             "binance_price": self.binance_price,
             "coinbase_price": self.coinbase_price,
             "latency_delta": self.latency_delta,
+            "delta_baseline": self.delta_baseline,
+            "delta_momentum": self.delta_momentum,
             "projected_settlement": self.projected_settlement,
             "binance_connected": self.binance_connected,
             "coinbase_connected": self.coinbase_connected,

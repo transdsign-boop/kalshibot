@@ -94,6 +94,8 @@ class TradingBot:
             "cycle_count": 0,
             "env": config.KALSHI_ENV,
             "alpha_latency_delta": 0.0,
+            "alpha_delta_momentum": 0.0,
+            "alpha_delta_baseline": 0.0,
             "alpha_projected_settlement": 0.0,
             "alpha_binance_connected": False,
             "alpha_coinbase_connected": False,
@@ -536,20 +538,23 @@ class TradingBot:
             # ── ALPHA ENGINE OVERRIDES ──────────────────────────────
             alpha_override = None
             if self.alpha and self.alpha.binance_connected and self.alpha.coinbase_connected:
-                delta = self.alpha.latency_delta
+                momentum = self.alpha.delta_momentum
                 secs_left = market.get("_seconds_to_close", 0)
-                self.status["alpha_latency_delta"] = delta
+                self.status["alpha_latency_delta"] = self.alpha.latency_delta
+                self.status["alpha_delta_momentum"] = momentum
+                self.status["alpha_delta_baseline"] = self.alpha.delta_baseline
                 self.status["alpha_projected_settlement"] = self.alpha.projected_settlement
                 self.status["alpha_binance_connected"] = True
                 self.status["alpha_coinbase_connected"] = True
 
-                # Override 1: Front-Run (latency delta exceeds threshold)
-                if delta > config.DELTA_THRESHOLD:
+                # Override 1: Front-Run (delta momentum — deviation from rolling baseline)
+                # Positive momentum = Binance leading up (bullish), Negative = leading down (bearish)
+                if momentum > config.DELTA_THRESHOLD:
                     alpha_override = "BUY_YES"
-                    log_event("ALPHA", f"Front-run BUY_YES: delta={delta:+.2f} > {config.DELTA_THRESHOLD}")
-                elif delta < -config.DELTA_THRESHOLD:
+                    log_event("ALPHA", f"Front-run BUY_YES: momentum={momentum:+.2f} > {config.DELTA_THRESHOLD}")
+                elif momentum < -config.DELTA_THRESHOLD:
                     alpha_override = "BUY_NO"
-                    log_event("ALPHA", f"Front-run BUY_NO: delta={delta:+.2f} < -{config.DELTA_THRESHOLD}")
+                    log_event("ALPHA", f"Front-run BUY_NO: momentum={momentum:+.2f} < -{config.DELTA_THRESHOLD}")
 
                 # Override 2: Anchor Defense (near expiry + holding position)
                 if secs_left < config.ANCHOR_SECONDS_THRESHOLD and my_pos:
@@ -607,15 +612,15 @@ class TradingBot:
             # 8. Execute
             side = "yes" if action == "BUY_YES" else "no"
 
-            # Aggressive pricing on extreme delta, else standard limit
-            extreme_delta = (
+            # Aggressive pricing on extreme momentum, else standard limit
+            extreme_momentum = (
                 self.alpha
-                and abs(self.alpha.latency_delta) > config.EXTREME_DELTA_THRESHOLD
+                and abs(self.alpha.delta_momentum) > config.EXTREME_DELTA_THRESHOLD
             )
-            if extreme_delta and best_ask < 100 and best_bid > 0:
+            if extreme_momentum and best_ask < 100 and best_bid > 0:
                 # Cross the spread — hit the ask (YES) or bid (NO)
                 price_cents = best_ask if side == "yes" else (100 - best_bid)
-                log_event("ALPHA", f"Extreme delta ({self.alpha.latency_delta:+.2f}) — aggressive pricing at {price_cents}c")
+                log_event("ALPHA", f"Extreme momentum ({self.alpha.delta_momentum:+.2f}) — aggressive pricing at {price_cents}c")
             else:
                 # Improve the best bid by 1c
                 price_cents = best_bid + 1 if side == "yes" else (100 - best_ask + 1)
@@ -652,7 +657,7 @@ class TradingBot:
             if order:
                 self.status["last_action"] = f"Placed {side.upper()} @ {price_cents}c x{qty}"
                 # Fill-or-cancel for non-extreme orders
-                if not extreme_delta:
+                if not extreme_momentum:
                     order_id = order.get("order_id")
                     if order_id:
                         await self._wait_and_retry(ticker, order_id, side, price_cents, qty)
