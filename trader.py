@@ -80,6 +80,7 @@ class TradingBot:
         self._active_env = config.KALSHI_ENV
         self._start_balance: float | None = None  # set on first cycle
         self._start_exposure: float = 0.0        # open position cost at start
+        self._free_rolled: set[str] = set()      # tickers where we already sold half
 
         # Live state exposed to the dashboard
         self.status: dict[str, Any] = {
@@ -142,36 +143,43 @@ class TradingBot:
         if self.http is None or self.http.is_closed:
             self.http = httpx.AsyncClient(
                 base_url=self.base_host,
-                timeout=15.0,
+                timeout=httpx.Timeout(30.0, connect=15.0),
             )
 
     def _full_path(self, path: str) -> str:
         """Prepend the API prefix to a relative path."""
         return f"{self.PATH_PREFIX}{path}"
 
-    async def _get(self, path: str, params: dict | None = None) -> dict:
-        await self._ensure_client()
+    async def _request(self, method: str, path: str, **kwargs) -> dict:
+        """HTTP request with automatic retry on transient network errors."""
         full = self._full_path(path)
-        headers = _sign_request(self.private_key, "GET", full)
-        resp = await self.http.get(full, params=params, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(3):
+            await self._ensure_client()
+            headers = _sign_request(self.private_key, method, full)
+            try:
+                resp = await self.http.request(method, full, headers=headers, **kwargs)
+                resp.raise_for_status()
+                return resp.json()
+            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as exc:
+                if attempt < 2:
+                    wait = 2 ** attempt  # 1s, 2s
+                    log_event("ERROR", f"{type(exc).__name__} on {method} {path} — retry {attempt+1}/2 in {wait}s")
+                    await asyncio.sleep(wait)
+                    # Force a fresh connection on retry
+                    if self.http and not self.http.is_closed:
+                        await self.http.aclose()
+                    self.http = None
+                else:
+                    raise
+
+    async def _get(self, path: str, params: dict | None = None) -> dict:
+        return await self._request("GET", path, params=params)
 
     async def _post(self, path: str, body: dict) -> dict:
-        await self._ensure_client()
-        full = self._full_path(path)
-        headers = _sign_request(self.private_key, "POST", full)
-        resp = await self.http.post(full, json=body, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+        return await self._request("POST", path, json=body)
 
     async def _delete(self, path: str) -> dict:
-        await self._ensure_client()
-        full = self._full_path(path)
-        headers = _sign_request(self.private_key, "DELETE", full)
-        resp = await self.http.delete(full, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+        return await self._request("DELETE", path)
 
     # ------------------------------------------------------------------
     # Kalshi API wrappers
@@ -430,6 +438,10 @@ class TradingBot:
             ticker = market.get("ticker", "")
             self.status["current_market"] = ticker
 
+            # Subscribe to live orderbook if Kalshi WS is connected
+            if self.alpha and self.alpha.kalshi_connected:
+                await self.alpha.subscribe_orderbook(ticker)
+
             # 3. Positions + P&L
             positions = await self.fetch_positions()
             my_pos = next((p for p in positions if p.get("ticker") == ticker), None)
@@ -469,8 +481,9 @@ class TradingBot:
                 await self.cancel_all_orders()
                 return
 
-            # 5. Orderbook + spread guard
-            ob = await self.fetch_orderbook(ticker)
+            # 5. Orderbook + spread guard (prefer live WS data, fall back to REST)
+            live_ob = self.alpha.get_live_orderbook(ticker) if self.alpha else None
+            ob = live_ob if live_ob else await self.fetch_orderbook(ticker)
             spread_ok, best_bid, best_ask = self._spread_guard(ob)
 
             # Store orderbook snapshot for dashboard (sorted best-first)
@@ -489,6 +502,7 @@ class TradingBot:
             }
 
             # Unrealized position P&L (mark-to-market vs cost)
+            secs_left = market.get("_seconds_to_close", 0)
             if my_pos:
                 pos_qty = my_pos.get("position", 0) or 0
                 pos_exposure_cents = my_pos.get("market_exposure", 0) or 0
@@ -502,20 +516,55 @@ class TradingBot:
                     mark_to_market = 0
                 self.status["position_pnl"] = (mark_to_market - pos_exposure_cents) / 100.0
 
-                # Stop-loss check: exit if loss per contract exceeds threshold
-                if config.STOP_LOSS_CENTS > 0 and abs(pos_qty) > 0 and config.TRADING_ENABLED:
-                    loss_per_contract = (pos_exposure_cents - mark_to_market) / abs(pos_qty)
-                    if loss_per_contract >= config.STOP_LOSS_CENTS:
-                        sell_side = "yes" if pos_qty > 0 else "no"
-                        sell_price = best_bid if pos_qty > 0 else (100 - best_ask)
-                        sell_price = max(1, min(99, sell_price))
+                # --- EXIT LOGIC (stop-loss + profit-taking) ---
+                if abs(pos_qty) > 0 and config.TRADING_ENABLED:
+                    sell_side = "yes" if pos_qty > 0 else "no"
+                    sell_price = best_bid if pos_qty > 0 else (100 - best_ask)
+                    sell_price = max(1, min(99, sell_price))
+                    current_value = sell_price  # what each contract is worth now
+
+                    # Rule: Last-Minute Hold — don't sell in final stretch, ride to settlement
+                    if secs_left < config.HOLD_EXPIRY_SECS:
+                        log_event("GUARD", f"Hold-to-expiry: {secs_left:.0f}s left — riding to settlement")
+                        self.status["last_action"] = f"Holding to expiry ({secs_left:.0f}s left)"
+                        return
+
+                    # Rule: Stop-loss (still active outside hold zone)
+                    if config.STOP_LOSS_CENTS > 0:
+                        loss_per_contract = (pos_exposure_cents - mark_to_market) / abs(pos_qty)
+                        if loss_per_contract >= config.STOP_LOSS_CENTS:
+                            sell_qty = abs(pos_qty)
+                            log_event("GUARD", f"Stop-loss triggered: down {loss_per_contract:.0f}c/contract (limit {config.STOP_LOSS_CENTS}c)")
+                            order = await self.close_position(ticker, sell_side, sell_price, sell_qty)
+                            if order:
+                                self.status["last_action"] = f"SL: sold {sell_qty}x {sell_side.upper()} @ {sell_price}c"
+                            else:
+                                self.status["last_action"] = "SL: sell order rejected"
+                            return
+
+                    # Rule: Pop-and-Drop — full exit at high profit with time remaining
+                    if current_value >= config.PROFIT_TAKE_PRICE and secs_left > config.PROFIT_TAKE_MIN_SECS:
                         sell_qty = abs(pos_qty)
-                        log_event("GUARD", f"Stop-loss triggered: down {loss_per_contract:.0f}c/contract (limit {config.STOP_LOSS_CENTS}c)")
+                        log_event("TRADE", f"Profit take: {current_value}c >= {config.PROFIT_TAKE_PRICE}c target, {secs_left:.0f}s left — selling all")
                         order = await self.close_position(ticker, sell_side, sell_price, sell_qty)
                         if order:
-                            self.status["last_action"] = f"SL: sold {sell_qty}x {sell_side.upper()} @ {sell_price}c"
+                            self.status["last_action"] = f"TP: sold {sell_qty}x {sell_side.upper()} @ {sell_price}c"
                         else:
-                            self.status["last_action"] = "SL: sell order rejected"
+                            self.status["last_action"] = "TP: sell order rejected"
+                        return
+
+                    # Rule: Free Roll — sell half at intermediate profit to lock in capital
+                    if (current_value >= config.FREE_ROLL_PRICE
+                            and ticker not in self._free_rolled
+                            and abs(pos_qty) >= 2):
+                        half_qty = max(1, abs(pos_qty) // 2)
+                        log_event("TRADE", f"Free roll: {current_value}c >= {config.FREE_ROLL_PRICE}c — selling {half_qty}/{abs(pos_qty)} to lock in capital")
+                        order = await self.close_position(ticker, sell_side, sell_price, half_qty)
+                        if order:
+                            self._free_rolled.add(ticker)
+                            self.status["last_action"] = f"Free roll: sold {half_qty}x {sell_side.upper()} @ {sell_price}c"
+                        else:
+                            self.status["last_action"] = "Free roll: sell order rejected"
                         return
             else:
                 self.status["position_pnl"] = 0.0
@@ -525,6 +574,8 @@ class TradingBot:
                 return
 
             # 6. Build data payload for the agent
+            # Use live ticker data if available for freshest volume/price
+            live_tkr = self.alpha.get_live_ticker(ticker) if self.alpha else None
             market_data = {
                 "ticker": ticker,
                 "title": market.get("title", ""),
@@ -532,8 +583,8 @@ class TradingBot:
                 "best_bid": best_bid,
                 "best_ask": best_ask,
                 "spread": best_ask - best_bid,
-                "last_price": market.get("last_price", 0),
-                "volume": market.get("volume", 0),
+                "last_price": live_tkr.get("yes_bid", market.get("last_price", 0)) if live_tkr else market.get("last_price", 0),
+                "volume": live_tkr.get("volume", market.get("volume", 0)) if live_tkr else market.get("volume", 0),
             }
 
             # ── ALPHA ENGINE OVERRIDES ──────────────────────────────
@@ -627,11 +678,15 @@ class TradingBot:
                 price_cents = best_bid + 1 if side == "yes" else (100 - best_ask + 1)
                 price_cents = max(1, min(99, price_cents))
 
-            # Respect min price guard
+            # Respect price guards (avoid lottery tickets AND terrible risk/reward)
             effective_price = price_cents if side == "yes" else (100 - price_cents)
             if effective_price < config.MIN_CONTRACT_PRICE:
                 log_event("GUARD", f"Price guard: {effective_price}c < {config.MIN_CONTRACT_PRICE}c min")
                 self.status["last_action"] = "Price too cheap — holding"
+                return
+            if effective_price > config.MAX_CONTRACT_PRICE:
+                log_event("GUARD", f"Price guard: {effective_price}c > {config.MAX_CONTRACT_PRICE}c max — bad risk/reward")
+                self.status["last_action"] = f"Price too expensive ({effective_price}c) — holding"
                 return
 
             # Portfolio-wide exposure guard (percentage of current balance)

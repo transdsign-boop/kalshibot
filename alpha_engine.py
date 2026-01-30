@@ -12,13 +12,17 @@ Exposes:
 """
 
 import asyncio
+import base64
 import json
 import random
 import time
 from datetime import datetime, timezone
 
 import websockets
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
+import config
 from database import log_event
 
 
@@ -53,6 +57,14 @@ class AlphaMonitor:
 
         self.projected_settlement: float = 0.0
 
+        # Kalshi real-time data (fed by WS ticker + orderbook_delta channels)
+        self.kalshi_connected: bool = False
+        self.kalshi_ticker: dict[str, dict] = {}   # ticker -> {yes_bid, yes_ask, volume, ...}
+        self.kalshi_orderbook: dict[str, dict] = {} # ticker -> {yes: [[p,q],...], no: [[p,q],...]}
+        self.kalshi_fills: list[dict] = []          # recent fills (last 50)
+        self._kalshi_subscribed_ob: set[str] = set()  # tickers with active OB subscriptions
+        self._kalshi_ws = None                      # reference to live WS for sending commands
+
         self._tasks: list[asyncio.Task] = []
         self._running: bool = False
 
@@ -61,14 +73,15 @@ class AlphaMonitor:
     # ------------------------------------------------------------------
 
     async def start(self):
-        """Launch both WebSocket listeners as background tasks."""
+        """Launch all WebSocket listeners as background tasks."""
         if self._running:
             return
         self._running = True
-        log_event("ALPHA", "Alpha Engine starting — connecting to Binance + Coinbase")
+        log_event("ALPHA", "Alpha Engine starting — connecting to Binance + Coinbase + Kalshi")
         self._tasks = [
             asyncio.create_task(self._binance_loop(), name="alpha-binance"),
             asyncio.create_task(self._coinbase_loop(), name="alpha-coinbase"),
+            asyncio.create_task(self._kalshi_loop(), name="alpha-kalshi"),
         ]
 
     async def stop(self):
@@ -81,6 +94,8 @@ class AlphaMonitor:
         self._tasks = []
         self.binance_connected = False
         self.coinbase_connected = False
+        self.kalshi_connected = False
+        self._kalshi_ws = None
         log_event("ALPHA", "Alpha Engine stopped")
 
     # ------------------------------------------------------------------
@@ -93,8 +108,8 @@ class AlphaMonitor:
             try:
                 async with websockets.connect(
                     self.BINANCE_WS_URL,
-                    ping_interval=30,
-                    ping_timeout=20,
+                    ping_interval=60,
+                    ping_timeout=30,
                     close_timeout=10,
                 ) as ws:
                     self.binance_connected = True
@@ -134,8 +149,8 @@ class AlphaMonitor:
             try:
                 async with websockets.connect(
                     self.COINBASE_WS_URL,
-                    ping_interval=30,
-                    ping_timeout=20,
+                    ping_interval=60,
+                    ping_timeout=30,
                     close_timeout=10,
                 ) as ws:
                     subscribe_msg = json.dumps({
@@ -174,6 +189,161 @@ class AlphaMonitor:
                 delay = min(delay * 2, self.RECONNECT_MAX_DELAY)
 
         self.coinbase_connected = False
+
+    # ------------------------------------------------------------------
+    # Kalshi WebSocket (real-time ticker + orderbook + fills)
+    # ------------------------------------------------------------------
+
+    def _kalshi_ws_url(self) -> str:
+        host = config.HOSTS.get(config.KALSHI_ENV, config.HOSTS["demo"])
+        return host.replace("https://", "wss://") + "/trade-api/ws/v2"
+
+    def _kalshi_auth_headers(self) -> dict:
+        """Build RSA-PSS auth headers for Kalshi WS handshake."""
+        import os
+        env = config.KALSHI_ENV
+
+        inline_var = f"KALSHI_{env.upper()}_PRIVATE_KEY"
+        raw = os.getenv(inline_var)
+        if not raw and env == "live":
+            raw = os.getenv("KALSHI_PRIVATE_KEY")
+        if raw:
+            private_key = serialization.load_pem_private_key(raw.encode(), password=None)
+        else:
+            path = (config.KALSHI_LIVE_PRIVATE_KEY_PATH if env == "live"
+                    else config.KALSHI_DEMO_PRIVATE_KEY_PATH)
+            with open(path, "rb") as f:
+                private_key = serialization.load_pem_private_key(f.read(), password=None)
+
+        timestamp_ms = str(int(time.time() * 1000))
+        message = f"{timestamp_ms}GET/trade-api/ws/v2".encode("utf-8")
+
+        signature = private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+
+        return {
+            "KALSHI-ACCESS-KEY": config.KALSHI_API_KEY_ID,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode("utf-8"),
+        }
+
+    async def _kalshi_loop(self):
+        delay = self.RECONNECT_BASE_DELAY
+        while self._running:
+            try:
+                headers = self._kalshi_auth_headers()
+                async with websockets.connect(
+                    self._kalshi_ws_url(),
+                    additional_headers=headers,
+                    ping_interval=None,  # Kalshi sends pings every 10s, library auto-pongs
+                    close_timeout=10,
+                ) as ws:
+                    self._kalshi_ws = ws
+                    self.kalshi_connected = True
+                    self._kalshi_subscribed_ob = set()
+                    delay = self.RECONNECT_BASE_DELAY
+                    log_event("ALPHA", "Kalshi WS connected")
+
+                    # Subscribe to ticker (all markets) + fill (all our fills)
+                    await ws.send(json.dumps({
+                        "id": 1,
+                        "cmd": "subscribe",
+                        "params": {"channels": ["ticker", "fill"]},
+                    }))
+
+                    async for raw_msg in ws:
+                        if not self._running:
+                            break
+                        try:
+                            payload = json.loads(raw_msg)
+                            msg_type = payload.get("type", "")
+                            msg = payload.get("msg", {})
+
+                            if msg_type == "ticker":
+                                ticker = msg.get("market_ticker", "")
+                                if ticker:
+                                    self.kalshi_ticker[ticker] = msg
+
+                            elif msg_type == "orderbook_snapshot":
+                                ticker = msg.get("market_ticker", "")
+                                if ticker:
+                                    self.kalshi_orderbook[ticker] = {
+                                        "yes": msg.get("yes", []),
+                                        "no": msg.get("no", []),
+                                    }
+
+                            elif msg_type == "orderbook_delta":
+                                ticker = msg.get("market_ticker", "")
+                                if ticker and ticker in self.kalshi_orderbook:
+                                    # Apply delta: replace price levels
+                                    for side in ("yes", "no"):
+                                        deltas = msg.get(side, [])
+                                        if not deltas:
+                                            continue
+                                        book = self.kalshi_orderbook[ticker].get(side, [])
+                                        book_dict = {p: q for p, q in book}
+                                        for p, q in deltas:
+                                            if q == 0:
+                                                book_dict.pop(p, None)
+                                            else:
+                                                book_dict[p] = q
+                                        self.kalshi_orderbook[ticker][side] = [
+                                            [p, q] for p, q in book_dict.items()
+                                        ]
+
+                            elif msg_type == "fill":
+                                self.kalshi_fills.append(msg)
+                                self.kalshi_fills = self.kalshi_fills[-50:]
+                                log_event("TRADE", f"WS fill: {msg.get('side','')} {msg.get('count',0)}x @ {msg.get('yes_price', msg.get('no_price','?'))}c on {msg.get('ticker','')}")
+
+                        except (json.JSONDecodeError, ValueError, KeyError):
+                            pass
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self.kalshi_connected = False
+                self._kalshi_ws = None
+                log_event("ALPHA", f"Kalshi WS error: {exc} — reconnecting in {delay:.1f}s")
+                jitter = delay * self.RECONNECT_JITTER * random.random()
+                await asyncio.sleep(delay + jitter)
+                delay = min(delay * 2, self.RECONNECT_MAX_DELAY)
+
+        self.kalshi_connected = False
+        self._kalshi_ws = None
+
+    async def subscribe_orderbook(self, ticker: str):
+        """Subscribe to orderbook_delta for a specific market ticker."""
+        if ticker in self._kalshi_subscribed_ob:
+            return
+        if self._kalshi_ws and self.kalshi_connected:
+            try:
+                await self._kalshi_ws.send(json.dumps({
+                    "id": 2,
+                    "cmd": "subscribe",
+                    "params": {
+                        "channels": ["orderbook_delta"],
+                        "market_tickers": [ticker],
+                    },
+                }))
+                self._kalshi_subscribed_ob.add(ticker)
+                log_event("ALPHA", f"Subscribed to orderbook for {ticker}")
+            except Exception as exc:
+                log_event("ALPHA", f"Failed to subscribe orderbook for {ticker}: {exc}")
+
+    def get_live_orderbook(self, ticker: str) -> dict | None:
+        """Get the live orderbook for a ticker, or None if not available."""
+        return self.kalshi_orderbook.get(ticker)
+
+    def get_live_ticker(self, ticker: str) -> dict | None:
+        """Get the latest ticker data for a market."""
+        return self.kalshi_ticker.get(ticker)
 
     # ------------------------------------------------------------------
     # Delta computation
@@ -269,4 +439,5 @@ class AlphaMonitor:
             "projected_settlement": self.projected_settlement,
             "binance_connected": self.binance_connected,
             "coinbase_connected": self.coinbase_connected,
+            "kalshi_connected": self.kalshi_connected,
         }

@@ -26,7 +26,10 @@ def _build_user_prompt(market_data: dict, current_position: dict | None) -> str:
 
 class MarketAgent:
     def __init__(self):
-        self.client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+        self.client = anthropic.AsyncAnthropic(
+            api_key=config.ANTHROPIC_API_KEY,
+            timeout=60.0,
+        )
         self.last_decision: dict | None = None
 
     async def analyze_market(

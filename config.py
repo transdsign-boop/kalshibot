@@ -41,7 +41,14 @@ MIN_SECONDS_TO_CLOSE = 90
 MAX_SPREAD_CENTS = 25
 MIN_AGENT_CONFIDENCE = 0.75
 MIN_CONTRACT_PRICE = 5
+MAX_CONTRACT_PRICE = 85           # avoid buying above this (bad risk/reward)
 STOP_LOSS_CENTS = 15              # exit position if down this many cents/contract
+
+# Profit-taking
+PROFIT_TAKE_PRICE = 94            # cents — full exit when contract hits this
+FREE_ROLL_PRICE = 90              # cents — sell half to lock in capital
+PROFIT_TAKE_MIN_SECS = 300        # only take full profit if >5 min remain
+HOLD_EXPIRY_SECS = 120            # don't sell in last 2 minutes — ride to settlement
 
 # Alpha Engine thresholds
 DELTA_THRESHOLD = 20              # USD — front-run trigger
@@ -63,7 +70,12 @@ TUNABLE_FIELDS = {
     "MAX_SPREAD_CENTS":     {"type": "int",   "min": 1,  "max": 100},
     "MIN_AGENT_CONFIDENCE": {"type": "float", "min": 0,  "max": 1},
     "MIN_CONTRACT_PRICE":   {"type": "int",   "min": 1,  "max": 55},
+    "MAX_CONTRACT_PRICE":   {"type": "int",   "min": 50, "max": 99},
     "STOP_LOSS_CENTS":      {"type": "int",   "min": 0,  "max": 50},
+    "PROFIT_TAKE_PRICE":    {"type": "int",   "min": 80, "max": 99},
+    "FREE_ROLL_PRICE":      {"type": "int",   "min": 75, "max": 99},
+    "PROFIT_TAKE_MIN_SECS": {"type": "int",   "min": 60, "max": 600},
+    "HOLD_EXPIRY_SECS":     {"type": "int",   "min": 30, "max": 300},
     "POLL_INTERVAL_SECONDS":{"type": "int",   "min": 5,  "max": 120},
     "DELTA_THRESHOLD":          {"type": "int",   "min": 5,   "max": 200},
     "EXTREME_DELTA_THRESHOLD":  {"type": "int",   "min": 10,  "max": 500},
