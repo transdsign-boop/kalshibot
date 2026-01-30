@@ -455,9 +455,10 @@ class TradingBot:
             )
             self.status["day_pnl"] = settled_pnl
 
-            # Daily loss circuit breaker
-            if settled_pnl < -config.MAX_DAILY_LOSS:
-                log_event("GUARD", f"Daily loss guard: ${settled_pnl:.2f} exceeds -${config.MAX_DAILY_LOSS:.2f} limit")
+            # Daily loss circuit breaker (percentage of starting balance)
+            max_daily_loss = self._start_balance * config.MAX_DAILY_LOSS_PCT / 100.0
+            if settled_pnl < -max_daily_loss:
+                log_event("GUARD", f"Daily loss guard: ${settled_pnl:.2f} exceeds -{config.MAX_DAILY_LOSS_PCT:.1f}% (${max_daily_loss:.2f}) limit")
                 self.status["last_action"] = f"Daily loss limit hit (${settled_pnl:.2f})"
                 return
 
@@ -633,26 +634,35 @@ class TradingBot:
                 self.status["last_action"] = "Price too cheap — holding"
                 return
 
-            # Portfolio-wide exposure guard (total $ at risk across all markets)
-            if total_exposure >= config.MAX_TOTAL_EXPOSURE:
-                log_event("GUARD", f"Exposure guard: ${total_exposure:.2f} >= ${config.MAX_TOTAL_EXPOSURE:.2f} limit")
+            # Portfolio-wide exposure guard (percentage of current balance)
+            max_exposure = balance * config.MAX_TOTAL_EXPOSURE_PCT / 100.0
+            if total_exposure >= max_exposure:
+                log_event("GUARD", f"Exposure guard: ${total_exposure:.2f} >= {config.MAX_TOTAL_EXPOSURE_PCT:.1f}% (${max_exposure:.2f}) limit")
                 self.status["last_action"] = f"Max exposure reached (${total_exposure:.2f})"
                 return
 
-            # Check current position to avoid exceeding MAX_POSITION_SIZE
+            # Dynamic contract sizing from balance percentages
+            # price_cents is the cost per contract we'd pay
+            position_budget = balance * config.MAX_POSITION_PCT / 100.0
+            max_position = max(1, int(position_budget / (price_cents / 100.0))) if price_cents > 0 else 1
+
+            order_budget = balance * config.ORDER_SIZE_PCT / 100.0
+            order_size = max(1, int(order_budget / (price_cents / 100.0))) if price_cents > 0 else 1
+
+            # Check current position to avoid exceeding max
             current_qty = 0
             if my_pos:
                 current_qty = (my_pos.get("yes_quantity", 0) or 0) + (my_pos.get("no_quantity", 0) or 0)
                 if current_qty < 0:
                     current_qty = my_pos.get("position", 0) or 0
                     current_qty = abs(current_qty)
-            remaining_capacity = config.MAX_POSITION_SIZE - current_qty
+            remaining_capacity = max_position - current_qty
             if remaining_capacity <= 0:
-                log_event("GUARD", f"Position guard: already at {current_qty}/{config.MAX_POSITION_SIZE} — holding")
+                log_event("GUARD", f"Position guard: {current_qty}/{max_position} contracts ({config.MAX_POSITION_PCT:.1f}% of balance)")
                 self.status["last_action"] = f"Max position reached ({current_qty})"
                 return
 
-            qty = min(config.ORDER_SIZE, remaining_capacity)
+            qty = min(order_size, remaining_capacity)
             order = await self.place_order(ticker, side, price_cents, qty)
             if order:
                 self.status["last_action"] = f"Placed {side.upper()} @ {price_cents}c x{qty}"

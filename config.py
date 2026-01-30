@@ -26,10 +26,11 @@ HOSTS = {
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 # --- Trading Rules (mutable at runtime) ---
-MAX_POSITION_SIZE = int(os.getenv("MAX_POSITION_SIZE", "50"))
-MAX_TOTAL_EXPOSURE = float(os.getenv("MAX_TOTAL_EXPOSURE", "10.00"))  # max $ at risk across all markets
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "25.00"))
-ORDER_SIZE = int(os.getenv("ORDER_SIZE", "10"))
+# Percentage-based sizing: scales automatically with account balance
+ORDER_SIZE_PCT = float(os.getenv("ORDER_SIZE_PCT", "5.0"))             # % of balance per order
+MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "15.0"))        # % of balance max position
+MAX_TOTAL_EXPOSURE_PCT = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "30.0"))  # % of balance max exposure
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "10.0"))    # % of balance max daily loss
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() == "true"
 
 # Target market series
@@ -54,10 +55,10 @@ POLL_INTERVAL_SECONDS = 10
 # --- Runtime helpers ---
 TUNABLE_FIELDS = {
     "TRADING_ENABLED":      {"type": "bool"},
-    "ORDER_SIZE":           {"type": "int",   "min": 1,  "max": 100},
-    "MAX_POSITION_SIZE":    {"type": "int",   "min": 1,  "max": 500},
-    "MAX_TOTAL_EXPOSURE":   {"type": "float", "min": 1,  "max": 500},
-    "MAX_DAILY_LOSS":       {"type": "float", "min": 1,  "max": 1000},
+    "ORDER_SIZE_PCT":       {"type": "float", "min": 0.5, "max": 50},
+    "MAX_POSITION_PCT":     {"type": "float", "min": 1,   "max": 100},
+    "MAX_TOTAL_EXPOSURE_PCT": {"type": "float", "min": 1, "max": 100},
+    "MAX_DAILY_LOSS_PCT":   {"type": "float", "min": 1,   "max": 100},
     "MIN_SECONDS_TO_CLOSE": {"type": "int",   "min": 30, "max": 600},
     "MAX_SPREAD_CENTS":     {"type": "int",   "min": 1,  "max": 100},
     "MIN_AGENT_CONFIDENCE": {"type": "float", "min": 0,  "max": 1},
