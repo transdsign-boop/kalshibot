@@ -387,7 +387,7 @@ class TradingBot:
                     self.status["last_action"] = f"Retry {side.upper()} @ {new_price}c x{remaining}"
                     log_event("ALPHA", f"Retry order placed: {side} @ {new_price}c x{remaining}")
         except Exception as exc:
-            log_event("ERROR", f"Fill-check error: {exc}")
+            log_event("ERROR", f"Fill-check error ({type(exc).__name__}): {exc!r}")
 
     # ------------------------------------------------------------------
     # Main loop
@@ -668,8 +668,11 @@ class TradingBot:
             log_event("ERROR", f"HTTP {exc.response.status_code}: {exc.response.text[:200]}")
             self.status["last_action"] = f"API error {exc.response.status_code}"
         except Exception as exc:
-            log_event("ERROR", f"Cycle error: {exc}")
-            self.status["last_action"] = f"Error: {exc}"
+            import traceback
+            tb = traceback.format_exc()
+            log_event("ERROR", f"Cycle error ({type(exc).__name__}): {exc!r}")
+            log_event("ERROR", f"Traceback: {tb[-500:]}")
+            self.status["last_action"] = f"Error: {type(exc).__name__}: {exc}"
 
     def stop(self):
         self.running = False
