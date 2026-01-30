@@ -190,6 +190,10 @@ class AlphaMonitor:
 
         self._minute_prices.append((time.time(), price))
 
+        # Keep projected_settlement always up-to-date (rolling average of current minute)
+        if self._minute_prices:
+            self.projected_settlement = sum(p for _, p in self._minute_prices) / len(self._minute_prices)
+
     def get_settlement_projection(
         self, strike_price: float, seconds_remaining: float
     ) -> bool:

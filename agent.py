@@ -3,13 +3,14 @@ import anthropic
 import config
 from database import log_event, record_decision
 
-SYSTEM_PROMPT = (
-    "You are a disciplined crypto derivatives trader. "
-    "The market is Kalshi BTC 15-min binaries. "
-    "We trade trends, not reversals. "
-    "We avoid contracts priced < 55 cents (lottery tickets). "
-    "Always respond with valid JSON only — no markdown, no extra text."
-)
+def _system_prompt() -> str:
+    return (
+        "You are a disciplined crypto derivatives trader. "
+        "The market is Kalshi BTC 15-min binaries. "
+        "We trade trends, not reversals. "
+        f"We avoid contracts priced < {config.MIN_CONTRACT_PRICE} cents (lottery tickets). "
+        "Always respond with valid JSON only — no markdown, no extra text."
+    )
 
 
 def _build_user_prompt(market_data: dict, current_position: dict | None) -> str:
@@ -42,7 +43,7 @@ class MarketAgent:
             response = self.client.messages.create(
                 model="claude-3-5-haiku-latest",
                 max_tokens=300,
-                system=SYSTEM_PROMPT,
+                system=_system_prompt(),
                 messages=[{"role": "user", "content": user_msg}],
             )
             raw = response.content[0].text.strip()
