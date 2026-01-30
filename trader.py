@@ -583,7 +583,7 @@ class TradingBot:
                     decision = {"decision": alpha_override, "confidence": 1.0,
                                 "reasoning": f"Alpha override: {alpha_override}"}
                 else:
-                    decision = self.agent.analyze_market(market_data, my_pos)
+                    decision = await self.agent.analyze_market(market_data, my_pos)
                 self.status["last_decision"] = decision
                 return
 
@@ -599,7 +599,7 @@ class TradingBot:
                     confidence=confidence, reasoning=reasoning, executed=True,
                 )
             else:
-                decision = self.agent.analyze_market(market_data, my_pos)
+                decision = await self.agent.analyze_market(market_data, my_pos)
                 self.status["last_decision"] = decision
 
                 action = decision["decision"]

@@ -26,10 +26,10 @@ def _build_user_prompt(market_data: dict, current_position: dict | None) -> str:
 
 class MarketAgent:
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        self.client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
         self.last_decision: dict | None = None
 
-    def analyze_market(
+    async def analyze_market(
         self, market_data: dict, current_position: dict | None = None
     ) -> dict:
         """Call Claude to get a trading decision.
@@ -40,7 +40,7 @@ class MarketAgent:
         user_msg = _build_user_prompt(market_data, current_position)
 
         try:
-            response = self.client.messages.create(
+            response = await self.client.messages.create(
                 model="claude-3-5-haiku-latest",
                 max_tokens=300,
                 system=_system_prompt(),
@@ -89,7 +89,7 @@ class MarketAgent:
         self.last_decision = fallback
         return fallback
 
-    def chat(self, user_message: str, bot_status: dict | None = None) -> str:
+    async def chat(self, user_message: str, bot_status: dict | None = None) -> str:
         """Free-form chat with the agent about markets / strategy."""
         context = ""
         if bot_status:
@@ -98,7 +98,7 @@ class MarketAgent:
             context += f"Last trading decision: {json.dumps(self.last_decision)}\n\n"
 
         try:
-            response = self.client.messages.create(
+            response = await self.client.messages.create(
                 model="claude-3-5-haiku-latest",
                 max_tokens=600,
                 system=(

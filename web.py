@@ -129,7 +129,7 @@ class ChatRequest(BaseModel):
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    reply = bot.agent.chat(req.message, bot.status)
+    reply = await bot.agent.chat(req.message, bot.status)
     return {"reply": reply}
 
 
