@@ -68,6 +68,7 @@ MAX_CONTRACT_PRICE = 85           # avoid buying above this (bad risk/reward)
 STOP_LOSS_CENTS = 15              # exit position if down this many cents/contract
 
 # Profit-taking
+HIT_RUN_PCT = float(os.getenv("HIT_RUN_PCT", "0"))  # % gain — instant exit when hit (no time restrictions)
 PROFIT_TAKE_PCT = 50              # % gain from entry — full exit when profit exceeds this
 FREE_ROLL_PRICE = 90              # cents — sell half to lock in capital
 PROFIT_TAKE_MIN_SECS = 300        # only take full profit if >5 min remain
@@ -100,6 +101,7 @@ TUNABLE_FIELDS = {
     "MIN_CONTRACT_PRICE":   {"type": "int",   "min": 1,  "max": 55},
     "MAX_CONTRACT_PRICE":   {"type": "int",   "min": 50, "max": 99},
     "STOP_LOSS_CENTS":      {"type": "int",   "min": 0,  "max": 50},
+    "HIT_RUN_PCT":          {"type": "float", "min": 0,  "max": 500},
     "PROFIT_TAKE_PCT":      {"type": "int",   "min": 5,  "max": 500},
     "FREE_ROLL_PRICE":      {"type": "int",   "min": 75, "max": 99},
     "PROFIT_TAKE_MIN_SECS": {"type": "int",   "min": 60, "max": 600},

@@ -66,6 +66,11 @@ const SETTINGS = {
     unit: '%',
     desc: 'Halt all trading if total realized losses exceed this percentage of your starting balance.',
   },
+  HIT_RUN_PCT: {
+    label: 'Hit & Run Target',
+    unit: '%',
+    desc: 'Instant profit exit - sell entire position as soon as profit hits this %. NO time restrictions. Set to 0 to disable.',
+  },
   PROFIT_TAKE_PCT: {
     label: 'Profit Take',
     unit: '%',
@@ -131,7 +136,7 @@ const GROUPS = [
   },
   {
     title: 'Profit & Exit',
-    keys: ['PROFIT_TAKE_PCT', 'PROFIT_TAKE_MIN_SECS', 'FREE_ROLL_PRICE', 'HOLD_EXPIRY_SECS'],
+    keys: ['HIT_RUN_PCT', 'PROFIT_TAKE_PCT', 'PROFIT_TAKE_MIN_SECS', 'FREE_ROLL_PRICE', 'HOLD_EXPIRY_SECS'],
   },
   {
     title: 'Alpha Engine',

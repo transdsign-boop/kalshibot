@@ -795,9 +795,22 @@ class TradingBot:
                                 self.status["last_action"] = "SL: sell order rejected"
                             return
 
-                    # Rule: Pop-and-Drop — full exit at % profit with time remaining
+                    # Calculate profit for all profit-taking rules
                     avg_cost = pos_exposure_cents / abs(pos_qty) if abs(pos_qty) > 0 else 0
                     gain_pct = ((current_value - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0
+
+                    # Rule: Hit-and-Run — instant exit at % profit (NO time restrictions)
+                    if config.HIT_RUN_PCT > 0 and gain_pct >= config.HIT_RUN_PCT:
+                        sell_qty = abs(pos_qty)
+                        log_event("TRADE", f"Hit-and-run: +{gain_pct:.0f}% gain ({current_value}c vs {avg_cost:.0f}c cost) >= {config.HIT_RUN_PCT}% target — instant exit")
+                        order = await self.close_position(ticker, sell_side, sell_price, sell_qty)
+                        if order:
+                            self.status["last_action"] = f"HIT&RUN: sold {sell_qty}x {sell_side.upper()} @ {sell_price}c (+{gain_pct:.0f}%)"
+                        else:
+                            self.status["last_action"] = "Hit&Run: sell order rejected"
+                        return
+
+                    # Rule: Pop-and-Drop — full exit at % profit with time remaining
                     if gain_pct >= config.PROFIT_TAKE_PCT and secs_left > config.PROFIT_TAKE_MIN_SECS:
                         sell_qty = abs(pos_qty)
                         log_event("TRADE", f"Profit take: +{gain_pct:.0f}% gain ({current_value}c vs {avg_cost:.0f}c cost) >= {config.PROFIT_TAKE_PCT}% target, {secs_left:.0f}s left — selling all")
