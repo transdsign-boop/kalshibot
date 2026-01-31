@@ -74,7 +74,11 @@ def log_event(level: str, message: str):
 
 
 def record_trade(market_id: str, side: str, action: str, price: float,
-                  quantity: int, order_id: str | None = None):
+                  quantity: int, order_id: str | None = None, exit_type: str | None = None):
+    """Record a trade with optional exit type (SL, TP, SETTLE for sell actions)."""
+    # For sell actions, use exit_type in the action field for better labeling
+    if action in ("SELL", "SETTLED") and exit_type:
+        action = exit_type
     with get_db() as conn:
         conn.execute(
             "INSERT INTO trades (ts, market_id, side, action, price, quantity, order_id) "

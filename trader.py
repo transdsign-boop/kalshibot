@@ -75,6 +75,7 @@ class TradingBot:
         self._start_balance: float | None = None  # set on first cycle
         self._start_exposure: float = 0.0        # open position cost at start
         self._free_rolled: set[str] = set()      # tickers where we already sold half
+        self._took_profit: set[str] = set()      # tickers where we've taken profit (prevent re-entry)
 
         # Paper trading state (used in demo/paper mode)
         self._paper_balance: float = config.PAPER_STARTING_BALANCE
@@ -392,11 +393,15 @@ class TradingBot:
         return {"order_id": order_id, "status": "filled", "filled_count": quantity, "remaining_count": 0}
 
     async def close_position(
-        self, ticker: str, side: str, price_cents: int, quantity: int
+        self, ticker: str, side: str, price_cents: int, quantity: int, exit_type: str = "SELL"
     ) -> dict | None:
-        """Sell an existing position at the given price."""
+        """Sell an existing position at the given price.
+
+        Args:
+            exit_type: Type of exit - "SL" (stop loss), "TP" (take profit), or "SELL" (manual)
+        """
         if self.paper_mode:
-            return self._paper_close_position(ticker, side, price_cents, quantity)
+            return self._paper_close_position(ticker, side, price_cents, quantity, exit_type)
 
         body = {
             "ticker": ticker,
@@ -413,7 +418,7 @@ class TradingBot:
             status = order.get("status", "")
             filled_count = order.get("filled_count", 0)
 
-            log_event("TRADE", f"SL SELL {side} @ {price_cents}c x{quantity} on {ticker} (status={status})")
+            log_event("TRADE", f"{exit_type} SELL {side} @ {price_cents}c x{quantity} on {ticker} (status={status})")
 
             if filled_count > 0:
                 record_trade(
@@ -423,14 +428,15 @@ class TradingBot:
                     price=price_cents / 100.0,
                     quantity=filled_count,
                     order_id=order_id,
+                    exit_type=exit_type,
                 )
-                log_event("TRADE", f"SL filled {filled_count}x {side} @ {price_cents}c on {ticker}")
+                log_event("TRADE", f"{exit_type} filled {filled_count}x {side} @ {price_cents}c on {ticker}")
             return order
         except httpx.HTTPStatusError as exc:
-            log_event("ERROR", f"SL order rejected: {exc.response.text[:200]}")
+            log_event("ERROR", f"{exit_type} order rejected: {exc.response.text[:200]}")
             return None
 
-    def _paper_close_position(self, ticker: str, side: str, price_cents: int, quantity: int) -> dict | None:
+    def _paper_close_position(self, ticker: str, side: str, price_cents: int, quantity: int, exit_type: str = "SELL") -> dict | None:
         """Simulate selling a position in paper mode."""
         pos = self._paper_positions.get(ticker)
         if not pos or pos["quantity"] <= 0:
@@ -456,8 +462,9 @@ class TradingBot:
             price=price_cents / 100.0,
             quantity=sell_qty,
             order_id=order_id,
+            exit_type=exit_type,
         )
-        log_event("SIM", f"[PAPER] SELL {sell_qty}x {side.upper()} @ {price_cents}c on {ticker} (proceeds ${proceeds_dollars:.2f}, bal ${self._paper_balance:.2f})")
+        log_event("SIM", f"[PAPER] {exit_type} {sell_qty}x {side.upper()} @ {price_cents}c on {ticker} (proceeds ${proceeds_dollars:.2f}, bal ${self._paper_balance:.2f})")
         self._save_paper_state()
 
         return {"order_id": order_id, "status": "filled", "filled_count": sell_qty, "remaining_count": 0}
@@ -529,6 +536,7 @@ class TradingBot:
                 price=settle_price / 100.0,  # cents → dollars (consistent with BUY)
                 quantity=qty,
                 order_id=f"paper-settle-{int(time.time() * 1000)}",
+                exit_type="SETTLE",
             )
             del self._paper_positions[ticker]
         self._save_paper_state()
@@ -683,10 +691,19 @@ class TradingBot:
             # Settle expired paper positions when market changes
             if self.paper_mode and self._last_paper_ticker and self._last_paper_ticker != ticker:
                 await self._settle_paper_positions(ticker)
+                # Clear tracking sets for new contract
+                self._free_rolled.clear()
+                self._took_profit.clear()
             if self.paper_mode:
                 if self._last_paper_ticker != ticker:
                     self._last_paper_ticker = ticker
                     self._save_paper_state()
+            else:
+                # In live mode, also clear tracking sets on ticker change
+                if self._last_paper_ticker != ticker:
+                    self._last_paper_ticker = ticker
+                    self._free_rolled.clear()
+                    self._took_profit.clear()
 
             # Subscribe to live orderbook if Kalshi WS is connected
             if self.alpha and self.alpha.kalshi_connected:
@@ -788,7 +805,7 @@ class TradingBot:
                         if loss_per_contract >= config.STOP_LOSS_CENTS:
                             sell_qty = abs(pos_qty)
                             log_event("GUARD", f"Stop-loss triggered: down {loss_per_contract:.0f}c/contract (limit {config.STOP_LOSS_CENTS}c)")
-                            order = await self.close_position(ticker, sell_side, sell_price, sell_qty)
+                            order = await self.close_position(ticker, sell_side, sell_price, sell_qty, exit_type="SL")
                             if order:
                                 self.status["last_action"] = f"SL: sold {sell_qty}x {sell_side.upper()} @ {sell_price}c"
                             else:
@@ -803,9 +820,11 @@ class TradingBot:
                     if config.HIT_RUN_PCT > 0 and gain_pct >= config.HIT_RUN_PCT:
                         sell_qty = abs(pos_qty)
                         log_event("TRADE", f"Hit-and-run: +{gain_pct:.0f}% gain ({current_value}c vs {avg_cost:.0f}c cost) >= {config.HIT_RUN_PCT}% target — instant exit")
-                        order = await self.close_position(ticker, sell_side, sell_price, sell_qty)
+                        order = await self.close_position(ticker, sell_side, sell_price, sell_qty, exit_type="TP")
                         if order:
                             self.status["last_action"] = f"HIT&RUN: sold {sell_qty}x {sell_side.upper()} @ {sell_price}c (+{gain_pct:.0f}%)"
+                            # Track this ticker as TP'd to prevent re-entry
+                            self._took_profit.add(ticker)
                         else:
                             self.status["last_action"] = "Hit&Run: sell order rejected"
                         return
@@ -814,9 +833,11 @@ class TradingBot:
                     if gain_pct >= config.PROFIT_TAKE_PCT and secs_left > config.PROFIT_TAKE_MIN_SECS:
                         sell_qty = abs(pos_qty)
                         log_event("TRADE", f"Profit take: +{gain_pct:.0f}% gain ({current_value}c vs {avg_cost:.0f}c cost) >= {config.PROFIT_TAKE_PCT}% target, {secs_left:.0f}s left — selling all")
-                        order = await self.close_position(ticker, sell_side, sell_price, sell_qty)
+                        order = await self.close_position(ticker, sell_side, sell_price, sell_qty, exit_type="TP")
                         if order:
                             self.status["last_action"] = f"TP: sold {sell_qty}x {sell_side.upper()} @ {sell_price}c (+{gain_pct:.0f}%)"
+                            # Track this ticker as TP'd to prevent re-entry
+                            self._took_profit.add(ticker)
                         else:
                             self.status["last_action"] = "TP: sell order rejected"
                         return
@@ -977,6 +998,12 @@ class TradingBot:
                     log_event("GUARD", f"Same-side guard: holding {held_side}, blocked {side.upper()} order")
                     self.status["last_action"] = f"Blocked — already holding {held_side}"
                     return
+
+            # Take-profit guard: never re-enter a contract after we've taken profit
+            if ticker in self._took_profit:
+                log_event("GUARD", f"TP guard: already took profit on {ticker} — no re-entry")
+                self.status["last_action"] = "Already took profit — no re-entry"
+                return
 
             # Aggressive pricing on extreme momentum, else standard limit
             extreme_momentum = (
