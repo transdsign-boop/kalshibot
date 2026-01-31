@@ -3,6 +3,7 @@ import { fetchStatus, fetchLogs, fetchTrades } from './api'
 import Header from './components/Header'
 import AgentHero from './components/AgentHero'
 import KeyMetrics from './components/KeyMetrics'
+import ExchangeMonitor from './components/ExchangeMonitor'
 import MarketCard from './components/MarketCard'
 import ContractTimer from './components/ContractTimer'
 import TradeLog from './components/TradeLog'
@@ -32,6 +33,7 @@ export default function App() {
       <Header status={status} onAction={refreshStatus} />
       <AgentHero status={status} />
       <KeyMetrics status={status} />
+      <ExchangeMonitor status={status} />
       <MarketCard status={status} />
       <ContractTimer status={status} />
       <TradeLog tradeData={tradeData} />
