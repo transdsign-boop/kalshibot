@@ -50,7 +50,7 @@ except ImportError:
 
 EXCHANGE_CONFIG = {
     'binance': {
-        'weight': 0.40,  # +0.05 from OKX
+        'weight': 0.35,
         'tier': 1,
         'role': 'lead',
         'symbol': 'BTC/USDT:USDT',
@@ -58,7 +58,7 @@ EXCHANGE_CONFIG = {
         'ccxt_options': {'defaultType': 'future'},
     },
     'bybit': {
-        'weight': 0.25,  # +0.05 from OKX
+        'weight': 0.20,
         'tier': 1,
         'role': 'lead',
         'symbol': 'BTC/USDT:USDT',
@@ -66,7 +66,7 @@ EXCHANGE_CONFIG = {
         'ccxt_options': {'defaultType': 'swap'},
     },
     'coinbase': {
-        'weight': 0.20,  # +0.02 from OKX
+        'weight': 0.18,
         'tier': 2,
         'role': 'settlement',
         'symbol': 'BTC/USD',
@@ -74,11 +74,11 @@ EXCHANGE_CONFIG = {
         'ccxt_options': {},
     },
     'okx': {
-        'weight': 0.00,  # DISABLED - geo-blocked or connection issues from Brazil
+        'weight': 0.12,
         'tier': 2,
         'role': 'lead',
         'symbol': 'BTC/USDT:USDT',
-        'label': 'OKX Futures',
+        'label': 'OKX Perpetual',
         'ccxt_options': {'defaultType': 'swap'},
     },
     'kraken': {
