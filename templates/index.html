@@ -110,12 +110,6 @@
         <span class="flex-1 text-center">NO bids</span>
       </div>
     </div>
-    <div class="card p-5">
-      <p class="text-xs text-gray-500 uppercase tracking-wide mb-2">Top of Book</p>
-      <div id="ob-levels" class="text-xs font-mono space-y-0.5 max-h-[80px] overflow-hidden">
-        <span class="text-gray-600">Waiting for data...</span>
-      </div>
-    </div>
   </div>
 
   <!-- Alpha Engine Cards -->
@@ -376,20 +370,6 @@
           document.getElementById('ob-yes-bar').style.height = Math.max(2, (yesDepth / maxDepth) * 36) + 'px';
           document.getElementById('ob-no-bar').style.height = Math.max(2, (noDepth / maxDepth) * 36) + 'px';
 
-          // Top-of-book levels
-          const levelsEl = document.getElementById('ob-levels');
-          let html = '';
-          const yesLevels = ob.yes_levels || [];
-          const noLevels = ob.no_levels || [];
-          const maxRows = Math.max(yesLevels.length, noLevels.length, 1);
-          for (let i = 0; i < Math.min(maxRows, 5); i++) {
-            const yp = yesLevels[i] ? yesLevels[i][0] + 'c' : '';
-            const yq = yesLevels[i] ? 'x' + yesLevels[i][1] : '';
-            const np = noLevels[i] ? noLevels[i][0] + 'c' : '';
-            const nq = noLevels[i] ? 'x' + noLevels[i][1] : '';
-            html += `<div class="flex justify-between"><span class="text-green-400">${yq} ${yp}</span><span class="text-gray-600">|</span><span class="text-red-400">${np} ${nq}</span></div>`;
-          }
-          levelsEl.innerHTML = html || '<span class="text-gray-600">Empty book</span>';
         }
 
         // Environment toggle styling

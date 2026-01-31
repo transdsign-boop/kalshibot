@@ -130,6 +130,75 @@ def get_todays_trades() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_trades_with_pnl(limit: int = 50) -> dict:
+    """Return recent trades with per-market P&L and summary stats."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT ts, market_id, side, action, price, quantity FROM trades ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    trades = [dict(r) for r in rows]
+
+    # Group by market_id to compute round-trip P&L
+    markets: dict[str, dict] = {}
+    for t in trades:
+        mid = t["market_id"]
+        if mid not in markets:
+            markets[mid] = {"buy_cost": 0.0, "sell_proceeds": 0.0, "has_buy": False, "has_sell": False}
+        m = markets[mid]
+        cost = t["price"] * t["quantity"]
+        if t["action"] == "BUY":
+            m["buy_cost"] += cost
+            m["has_buy"] = True
+        elif t["action"] in ("SELL", "SETTLED"):
+            m["sell_proceeds"] += cost
+            m["has_sell"] = True
+
+    # Compute summary
+    wins = 0
+    losses = 0
+    pending = 0
+    net_pnl = 0.0
+    market_pnl: dict[str, float | None] = {}
+
+    for mid, m in markets.items():
+        if m["has_buy"] and m["has_sell"]:
+            pnl = m["sell_proceeds"] - m["buy_cost"]
+            market_pnl[mid] = pnl
+            net_pnl += pnl
+            if pnl > 0:
+                wins += 1
+            else:
+                losses += 1
+        elif m["has_buy"]:
+            market_pnl[mid] = None  # still open
+            pending += 1
+
+    total_completed = wins + losses
+    win_rate = wins / total_completed if total_completed > 0 else 0.0
+
+    # Attach pnl to sell/settled rows
+    for t in trades:
+        mid = t["market_id"]
+        if t["action"] in ("SELL", "SETTLED") and mid in market_pnl:
+            t["pnl"] = market_pnl[mid]
+        else:
+            t["pnl"] = None
+
+    return {
+        "trades": trades,
+        "summary": {
+            "total_trades": total_completed,
+            "wins": wins,
+            "losses": losses,
+            "pending": pending,
+            "net_pnl": round(net_pnl, 2),
+            "win_rate": round(win_rate, 3),
+        },
+    }
+
+
 def get_setting(key: str, default: str | None = None) -> str | None:
     with get_db() as conn:
         row = conn.execute(

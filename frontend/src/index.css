@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+body {
+  background: #0a0b10;
+  color: #e2e8f0;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.card {
+  background: #13151e;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 16px;
+}
+
+.pulse-live {
+  animation: pulse-live 2s ease-in-out infinite;
+}
+@keyframes pulse-live {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* Collapsible sections */
+.collapse-body {
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 0.3s ease-out;
+}
+.collapse-body.open {
+  max-height: 2000px;
+  transition: max-height 0.5s ease-in;
+}
+
+/* Log panel */
+.log-box {
+  max-height: 300px;
+  overflow-y: auto;
+  font-family: 'Fira Code', 'JetBrains Mono', 'Courier New', monospace;
+  font-size: 0.75rem;
+  line-height: 1.6;
+}
+.log-box::-webkit-scrollbar { width: 4px; }
+.log-box::-webkit-scrollbar-thumb { background: #2a2d3e; border-radius: 2px; }
+.log-box::-webkit-scrollbar-track { background: transparent; }
+
+/* Chat messages */
+.chat-messages {
+  max-height: 200px;
+  overflow-y: auto;
+}
+.chat-messages::-webkit-scrollbar { width: 4px; }
+.chat-messages::-webkit-scrollbar-thumb { background: #2a2d3e; border-radius: 2px; }

@@ -195,24 +195,18 @@ class AlphaMonitor:
     # ------------------------------------------------------------------
 
     def _kalshi_ws_url(self) -> str:
-        host = config.HOSTS.get(config.KALSHI_ENV, config.HOSTS["demo"])
-        return host.replace("https://", "wss://") + "/trade-api/ws/v2"
+        return config.KALSHI_HOST.replace("https://", "wss://") + "/trade-api/ws/v2"
 
     def _kalshi_auth_headers(self) -> dict:
         """Build RSA-PSS auth headers for Kalshi WS handshake."""
         import os
-        env = config.KALSHI_ENV
 
-        inline_var = f"KALSHI_{env.upper()}_PRIVATE_KEY"
-        raw = os.getenv(inline_var)
-        if not raw and env == "live":
-            raw = os.getenv("KALSHI_PRIVATE_KEY")
+        # Always use live credentials
+        raw = os.getenv("KALSHI_LIVE_PRIVATE_KEY") or os.getenv("KALSHI_PRIVATE_KEY")
         if raw:
             private_key = serialization.load_pem_private_key(raw.encode(), password=None)
         else:
-            path = (config.KALSHI_LIVE_PRIVATE_KEY_PATH if env == "live"
-                    else config.KALSHI_DEMO_PRIVATE_KEY_PATH)
-            with open(path, "rb") as f:
+            with open(config.KALSHI_LIVE_PRIVATE_KEY_PATH, "rb") as f:
                 private_key = serialization.load_pem_private_key(f.read(), password=None)
 
         timestamp_ms = str(int(time.time() * 1000))

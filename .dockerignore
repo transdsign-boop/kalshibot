@@ -5,3 +5,5 @@ __pycache__
 *.pyc
 *.db
 .venv
+frontend/node_modules
+frontend/dist

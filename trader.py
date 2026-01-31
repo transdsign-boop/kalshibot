@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import re
 import time
 from datetime import datetime, timezone
@@ -14,22 +15,15 @@ from agent import MarketAgent
 from database import init_db, log_event, record_trade, record_decision, get_setting, set_setting
 
 
-def _load_private_key(env: str | None = None):
-    """Load the RSA private key for the given (or current) environment."""
+def _load_private_key():
+    """Load the RSA private key (always live — demo mode is paper trading)."""
     import os
-    env = env or config.KALSHI_ENV
 
-    # Fly.io: check inline env var first (per-environment, then generic fallback for live only)
-    inline_var = f"KALSHI_{env.upper()}_PRIVATE_KEY"
-    raw = os.getenv(inline_var)
-    if not raw and env == "live":
-        raw = os.getenv("KALSHI_PRIVATE_KEY")
+    raw = os.getenv("KALSHI_LIVE_PRIVATE_KEY") or os.getenv("KALSHI_PRIVATE_KEY")
     if raw:
         return serialization.load_pem_private_key(raw.encode(), password=None)
 
-    path = (config.KALSHI_LIVE_PRIVATE_KEY_PATH if env == "live"
-            else config.KALSHI_DEMO_PRIVATE_KEY_PATH)
-    with open(path, "rb") as f:
+    with open(config.KALSHI_LIVE_PRIVATE_KEY_PATH, "rb") as f:
         return serialization.load_pem_private_key(f.read(), password=None)
 
 
@@ -82,6 +76,12 @@ class TradingBot:
         self._start_exposure: float = 0.0        # open position cost at start
         self._free_rolled: set[str] = set()      # tickers where we already sold half
 
+        # Paper trading state (used in demo/paper mode)
+        self._paper_balance: float = config.PAPER_STARTING_BALANCE
+        self._paper_positions: dict[str, dict] = {}  # ticker -> {side, quantity, avg_price_cents, market_exposure_cents}
+        self._paper_trades: list[dict] = []
+        self._last_paper_ticker: str | None = None
+
         # Live state exposed to the dashboard
         self.status: dict[str, Any] = {
             "running": False,
@@ -101,11 +101,58 @@ class TradingBot:
             "alpha_binance_connected": False,
             "alpha_coinbase_connected": False,
             "alpha_override": None,
+            "seconds_to_close": None,
+            "strike_price": None,
+            "close_time": None,
+            "market_title": None,
         }
 
     @property
     def base_host(self) -> str:
-        return config.HOSTS.get(config.KALSHI_ENV, config.HOSTS["demo"])
+        return config.KALSHI_HOST
+
+    @property
+    def paper_mode(self) -> bool:
+        return config.KALSHI_ENV == "demo"
+
+    def _save_paper_state(self):
+        """Persist paper balance and positions to DB so state survives restarts."""
+        set_setting("paper_balance", str(self._paper_balance))
+        set_setting("paper_positions", json.dumps(self._paper_positions))
+        set_setting("paper_last_ticker", self._last_paper_ticker or "")
+
+    def _restore_paper_state(self):
+        """Restore paper trading state from DB after a restart."""
+        saved_balance = get_setting("paper_balance")
+        if saved_balance is not None:
+            try:
+                self._paper_balance = float(saved_balance)
+                log_event("INFO", f"Restored paper balance: ${self._paper_balance:.2f}")
+            except ValueError:
+                pass
+
+        saved_positions = get_setting("paper_positions")
+        if saved_positions:
+            try:
+                self._paper_positions = json.loads(saved_positions)
+                if self._paper_positions:
+                    log_event("INFO", f"Restored {len(self._paper_positions)} paper position(s)")
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        saved_ticker = get_setting("paper_last_ticker")
+        if saved_ticker:
+            self._last_paper_ticker = saved_ticker
+
+    def reset_paper_trading(self):
+        """Reset all paper trading state — balance, positions, and trade history."""
+        self._paper_balance = config.PAPER_STARTING_BALANCE
+        self._paper_positions = {}
+        self._last_paper_ticker = None
+        self._start_balance = None
+        self._start_exposure = 0.0
+        self._save_paper_state()
+        log_event("INFO", f"Paper trading reset — balance: ${config.PAPER_STARTING_BALANCE:.2f}")
 
     async def switch_environment(self, env: str):
         """Switch between 'demo' and 'live'. Stops the bot, swaps creds, resets client."""
@@ -116,7 +163,7 @@ class TradingBot:
             await asyncio.sleep(1)
 
         config.switch_env(env)
-        self.private_key = _load_private_key(env)
+        self.private_key = _load_private_key()
         self._active_env = env
 
         # Force new HTTP client on next request
@@ -133,7 +180,13 @@ class TradingBot:
         self._start_balance = None  # reset so P&L recalculates for new env
         self._start_exposure = 0.0
         set_setting("env", env)
-        log_event("INFO", f"Switched to {env.upper()} environment")
+
+        # Restore or initialize paper trading state
+        if env == "demo":
+            self._restore_paper_state()
+            log_event("INFO", f"Switched to PAPER mode (balance: ${self._paper_balance:.2f})")
+        else:
+            log_event("INFO", "Switched to LIVE environment")
 
     # ------------------------------------------------------------------
     # HTTP helpers (Kalshi REST API via httpx + RSA-PSS auth)
@@ -186,6 +239,8 @@ class TradingBot:
     # ------------------------------------------------------------------
 
     async def fetch_balance(self) -> float:
+        if self.paper_mode:
+            return self._paper_balance
         data = await self._get("/portfolio/balance")
         # Balance returned in cents
         balance_cents = data.get("balance", 0)
@@ -225,19 +280,33 @@ class TradingBot:
         return data.get("orderbook", data)
 
     async def fetch_positions(self) -> list[dict]:
+        if self.paper_mode:
+            return [
+                {
+                    "ticker": ticker,
+                    "position": p["quantity"] if p["side"] == "yes" else -p["quantity"],
+                    "market_exposure": p["market_exposure_cents"],
+                }
+                for ticker, p in self._paper_positions.items()
+                if p["quantity"] > 0
+            ]
         data = await self._get("/portfolio/positions", params={"limit": 20})
         return data.get("market_positions", [])
 
     async def cancel_all_orders(self):
+        if self.paper_mode:
+            return  # No real orders to cancel in paper mode
         try:
             await _safe(self._post("/portfolio/orders/batched", {"action": "cancel_all"}))
         except Exception:
-            # Endpoint may not exist in demo; swallow
             pass
 
     async def place_order(
         self, ticker: str, side: str, price_cents: int, quantity: int
     ) -> dict | None:
+        if self.paper_mode:
+            return self._paper_place_order(ticker, side, price_cents, quantity)
+
         body = {
             "ticker": ticker,
             "action": "buy",
@@ -272,10 +341,63 @@ class TradingBot:
             log_event("ERROR", f"Order rejected: {exc.response.text[:200]}")
             return None
 
+    def _paper_place_order(self, ticker: str, side: str, price_cents: int, quantity: int) -> dict:
+        """Simulate a buy order in paper mode."""
+        cost_cents = price_cents * quantity
+        cost_dollars = cost_cents / 100.0
+
+        if cost_dollars > self._paper_balance:
+            log_event("SIM", f"[PAPER] Insufficient balance: need ${cost_dollars:.2f}, have ${self._paper_balance:.2f}")
+            return None
+
+        self._paper_balance -= cost_dollars
+
+        # Accumulate position
+        if ticker in self._paper_positions:
+            pos = self._paper_positions[ticker]
+            if pos["side"] == side:
+                # Same side — average in
+                old_total = pos["avg_price_cents"] * pos["quantity"]
+                new_total = price_cents * quantity
+                pos["quantity"] += quantity
+                pos["avg_price_cents"] = (old_total + new_total) / pos["quantity"]
+                pos["market_exposure_cents"] += cost_cents
+            else:
+                # Opposite side — reduce position
+                reduce = min(quantity, pos["quantity"])
+                pos["quantity"] -= reduce
+                pos["market_exposure_cents"] -= pos["avg_price_cents"] * reduce
+                if pos["quantity"] <= 0:
+                    del self._paper_positions[ticker]
+        else:
+            self._paper_positions[ticker] = {
+                "side": side,
+                "quantity": quantity,
+                "avg_price_cents": price_cents,
+                "market_exposure_cents": cost_cents,
+            }
+
+        order_id = f"paper-{int(time.time() * 1000)}"
+        record_trade(
+            market_id=f"[PAPER] {ticker}",
+            side=side,
+            action="BUY",
+            price=price_cents / 100.0,
+            quantity=quantity,
+            order_id=order_id,
+        )
+        log_event("SIM", f"[PAPER] BUY {quantity}x {side.upper()} @ {price_cents}c on {ticker} (cost ${cost_dollars:.2f}, bal ${self._paper_balance:.2f})")
+        self._save_paper_state()
+
+        return {"order_id": order_id, "status": "filled", "filled_count": quantity, "remaining_count": 0}
+
     async def close_position(
         self, ticker: str, side: str, price_cents: int, quantity: int
     ) -> dict | None:
         """Sell an existing position at the given price."""
+        if self.paper_mode:
+            return self._paper_close_position(ticker, side, price_cents, quantity)
+
         body = {
             "ticker": ticker,
             "action": "sell",
@@ -307,6 +429,109 @@ class TradingBot:
         except httpx.HTTPStatusError as exc:
             log_event("ERROR", f"SL order rejected: {exc.response.text[:200]}")
             return None
+
+    def _paper_close_position(self, ticker: str, side: str, price_cents: int, quantity: int) -> dict | None:
+        """Simulate selling a position in paper mode."""
+        pos = self._paper_positions.get(ticker)
+        if not pos or pos["quantity"] <= 0:
+            log_event("SIM", f"[PAPER] No position to close for {ticker}")
+            return None
+
+        sell_qty = min(quantity, pos["quantity"])
+        proceeds_cents = price_cents * sell_qty
+        proceeds_dollars = proceeds_cents / 100.0
+
+        self._paper_balance += proceeds_dollars
+
+        pos["quantity"] -= sell_qty
+        pos["market_exposure_cents"] -= pos["avg_price_cents"] * sell_qty
+        if pos["quantity"] <= 0:
+            del self._paper_positions[ticker]
+
+        order_id = f"paper-sell-{int(time.time() * 1000)}"
+        record_trade(
+            market_id=f"[PAPER] {ticker}",
+            side=side,
+            action="SELL",
+            price=price_cents / 100.0,
+            quantity=sell_qty,
+            order_id=order_id,
+        )
+        log_event("SIM", f"[PAPER] SELL {sell_qty}x {side.upper()} @ {price_cents}c on {ticker} (proceeds ${proceeds_dollars:.2f}, bal ${self._paper_balance:.2f})")
+        self._save_paper_state()
+
+        return {"order_id": order_id, "status": "filled", "filled_count": sell_qty, "remaining_count": 0}
+
+    async def _settle_paper_positions(self, new_ticker: str):
+        """Settle expired paper positions by checking the actual market result.
+
+        Queries the Kalshi API for each expired market to determine whether
+        YES or NO won.  Binary payout: winning side pays 100c/contract,
+        losing side pays 0c.
+        """
+        if not self.paper_mode:
+            return
+
+        expired_tickers = [t for t in self._paper_positions if t != new_ticker]
+        for ticker in expired_tickers:
+            pos = self._paper_positions[ticker]
+            qty = pos["quantity"]
+            side = pos["side"]
+            exposure_cents = pos["market_exposure_cents"]
+
+            # Query Kalshi for the actual market result (may need retries —
+            # Kalshi takes ~60s to settle after close)
+            settle_price = 0
+            result = ""
+            market_data = {}
+            for attempt in range(7):  # try up to 7 times over ~90s (covers 60s settlement)
+                try:
+                    mkt = await self._get(f"/markets/{ticker}")
+                    market_data = mkt.get("market", mkt)
+                    result = market_data.get("result", "")
+                    if result:
+                        break
+                except Exception as exc:
+                    log_event("ERROR", f"[PAPER] Could not fetch result for {ticker} (attempt {attempt+1}): {exc}")
+                if attempt < 6:
+                    await asyncio.sleep(15)
+
+            if result and result.lower() == side:
+                settle_price = 100
+            elif not result:
+                # Kalshi hasn't settled yet — use projected settlement as fallback
+                if self.alpha and self.alpha.projected_settlement > 0:
+                    strike = self._extract_strike(market_data) if market_data else None
+                    if strike and strike > 0:
+                        yes_wins = self.alpha.projected_settlement >= strike
+                        if (yes_wins and side == "yes") or (not yes_wins and side == "no"):
+                            settle_price = 100
+                        log_event("SIM", f"[PAPER] Using projected settlement ${self.alpha.projected_settlement:.2f} vs strike ${strike:.2f} → {'YES' if yes_wins else 'NO'}")
+                    else:
+                        log_event("SIM", f"[PAPER] Market {ticker} result unknown, no strike — settling at 0")
+                else:
+                    log_event("SIM", f"[PAPER] Market {ticker} result unknown, no projection — settling at 0")
+
+            log_event("SIM", f"[PAPER] Market {ticker} result: {result.upper() if result else 'PROJECTED'}")
+
+            # Credit payout to paper balance
+            payout_cents = settle_price * qty
+            self._paper_balance += payout_cents / 100.0
+
+            pnl_cents = payout_cents - exposure_cents
+            outcome = "WON" if pnl_cents > 0 else "LOST" if pnl_cents < 0 else "BREAK-EVEN"
+            log_event("SIM", f"[PAPER] SETTLED {ticker}: {qty}x {side.upper()} → {outcome} (payout ${payout_cents/100:.2f}, cost ${exposure_cents/100:.2f}, P&L ${pnl_cents/100:+.2f})")
+
+            record_trade(
+                market_id=f"[PAPER] {ticker}",
+                side=side,
+                action="SETTLED",
+                price=settle_price / 100.0,  # cents → dollars (consistent with BUY)
+                quantity=qty,
+                order_id=f"paper-settle-{int(time.time() * 1000)}",
+            )
+            del self._paper_positions[ticker]
+        self._save_paper_state()
 
     # ------------------------------------------------------------------
     # Safety layer ("reflexes")
@@ -349,31 +574,38 @@ class TradingBot:
         return True, best_bid, best_ask
 
     def _extract_strike(self, market: dict) -> float | None:
-        """Extract the strike price from a KXBTC15M market.
+        """Extract the strike / reference price from a KXBTC15M market.
 
         Tries structured fields first (floor_strike / strike_price),
-        then falls back to parsing from the title, e.g.
-        'BTC above $95,000 at 12:15 PM ET'.
+        then falls back to parsing dollar amounts from yes_sub_title or title.
         """
         strike = market.get("floor_strike") or market.get("strike_price")
         if strike:
             try:
-                return float(strike) / 100.0  # Kalshi often uses cents
+                val = float(strike)
+                # BTC strikes are already in dollars (e.g., 83873.08).
+                # Small values (<1000) might be cents from other market types.
+                return val if val > 1000 else val / 100.0
             except (ValueError, TypeError):
                 pass
 
-        title = market.get("title", "")
-        match = re.search(r'\$([0-9,]+)', title)
-        if match:
-            try:
-                return float(match.group(1).replace(",", ""))
-            except ValueError:
-                pass
+        # Fall back to parsing dollar amounts from subtitles or title
+        # yes_sub_title example: "Price to beat: $83,873.07"
+        for field in ("yes_sub_title", "title"):
+            text = market.get(field, "")
+            match = re.search(r'\$([0-9,.]+)', text)
+            if match:
+                try:
+                    return float(match.group(1).replace(",", ""))
+                except ValueError:
+                    pass
         return None
 
     async def _wait_and_retry(self, ticker: str, order_id: str, side: str,
                                price_cents: int, qty: int):
         """Wait 3s for a fill; cancel and retry 1c more aggressive if unfilled."""
+        if self.paper_mode:
+            return  # Paper orders fill instantly
         await asyncio.sleep(3)
         try:
             order_status = await self._get(f"/portfolio/orders/{order_id}")
@@ -432,11 +664,29 @@ class TradingBot:
             if market is None:
                 self.status["current_market"] = None
                 self.status["last_action"] = "No open market found"
+                self.status["seconds_to_close"] = None
+                self.status["strike_price"] = None
+                self.status["close_time"] = None
+                self.status["market_title"] = None
                 log_event("INFO", "No active KXBTC15M market found")
                 return
 
             ticker = market.get("ticker", "")
             self.status["current_market"] = ticker
+            self.status["seconds_to_close"] = market.get("_seconds_to_close")
+            self.status["strike_price"] = self._extract_strike(market)
+            self.status["close_time"] = market.get("close_time") or market.get("expected_expiration_time")
+            self.status["market_title"] = market.get("title", "")
+            # Store raw market for debug (exclude internal computed fields)
+            self.status["_raw_market"] = {k: v for k, v in market.items() if not k.startswith("_")}
+
+            # Settle expired paper positions when market changes
+            if self.paper_mode and self._last_paper_ticker and self._last_paper_ticker != ticker:
+                await self._settle_paper_positions(ticker)
+            if self.paper_mode:
+                if self._last_paper_ticker != ticker:
+                    self._last_paper_ticker = ticker
+                    self._save_paper_state()
 
             # Subscribe to live orderbook if Kalshi WS is connected
             if self.alpha and self.alpha.kalshi_connected:
@@ -465,38 +715,26 @@ class TradingBot:
             settled_pnl = (
                 (balance + total_exposure) - (self._start_balance + self._start_exposure)
             )
-            self.status["day_pnl"] = settled_pnl
-
             # Daily loss circuit breaker (percentage of starting balance)
+            # Uses realized P&L only — unrealized swings shouldn't trigger halt
             max_daily_loss = self._start_balance * config.MAX_DAILY_LOSS_PCT / 100.0
             if settled_pnl < -max_daily_loss:
                 log_event("GUARD", f"Daily loss guard: ${settled_pnl:.2f} exceeds -{config.MAX_DAILY_LOSS_PCT:.1f}% (${max_daily_loss:.2f}) limit")
                 self.status["last_action"] = f"Daily loss limit hit (${settled_pnl:.2f})"
                 return
 
-            # 4. Time guard
-            if not self._time_guard(market):
-                self.status["last_action"] = "Time guard — sleeping"
-                # Cancel open orders near expiry
-                await self.cancel_all_orders()
-                return
-
-            # 5. Orderbook + spread guard (prefer live WS data, fall back to REST)
+            # 4. Orderbook (always fetch — needed for dashboard + P&L even during guards)
             live_ob = self.alpha.get_live_orderbook(ticker) if self.alpha else None
             ob = live_ob if live_ob else await self.fetch_orderbook(ticker)
             spread_ok, best_bid, best_ask = self._spread_guard(ob)
 
-            # Store orderbook snapshot for dashboard (sorted best-first)
+            # Store orderbook snapshot for dashboard
             yes_orders = ob.get("yes", []) if isinstance(ob.get("yes"), list) else []
             no_orders = ob.get("no", []) if isinstance(ob.get("no"), list) else []
-            yes_sorted = sorted(yes_orders, key=lambda x: x[0], reverse=True)
-            no_sorted = sorted(no_orders, key=lambda x: x[0], reverse=True)
             self.status["orderbook"] = {
                 "best_bid": best_bid,
                 "best_ask": best_ask,
                 "spread": best_ask - best_bid,
-                "yes_levels": yes_sorted[:5],   # top 5 YES bid levels (best first)
-                "no_levels": no_sorted[:5],      # top 5 NO bid levels (best first)
                 "yes_depth": sum(q for _, q in yes_orders),
                 "no_depth": sum(q for _, q in no_orders),
             }
@@ -515,13 +753,28 @@ class TradingBot:
                 else:
                     mark_to_market = 0
                 self.status["position_pnl"] = (mark_to_market - pos_exposure_cents) / 100.0
+            else:
+                self.status["position_pnl"] = 0.0
 
-                # --- EXIT LOGIC (stop-loss + profit-taking) ---
+            # All-time P&L: paper uses fixed starting balance, live uses session start
+            if self.paper_mode:
+                all_time_pnl = (balance + total_exposure) - config.PAPER_STARTING_BALANCE
+            else:
+                all_time_pnl = settled_pnl
+            self.status["day_pnl"] = all_time_pnl + self.status["position_pnl"]
+
+            # 5. Exit logic (stop-loss + profit-taking) — before time guard
+            #    so hold-to-expiry can still fire, but after P&L is computed
+            if my_pos:
+                pos_qty = my_pos.get("position", 0) or 0
+                pos_exposure_cents = my_pos.get("market_exposure", 0) or 0
+                mark_to_market_exit = best_bid * pos_qty if pos_qty > 0 else (100 - best_ask) * abs(pos_qty) if pos_qty < 0 else 0
+
                 if abs(pos_qty) > 0 and config.TRADING_ENABLED:
                     sell_side = "yes" if pos_qty > 0 else "no"
                     sell_price = best_bid if pos_qty > 0 else (100 - best_ask)
                     sell_price = max(1, min(99, sell_price))
-                    current_value = sell_price  # what each contract is worth now
+                    current_value = sell_price
 
                     # Rule: Last-Minute Hold — don't sell in final stretch, ride to settlement
                     if secs_left < config.HOLD_EXPIRY_SECS:
@@ -531,7 +784,7 @@ class TradingBot:
 
                     # Rule: Stop-loss (still active outside hold zone)
                     if config.STOP_LOSS_CENTS > 0:
-                        loss_per_contract = (pos_exposure_cents - mark_to_market) / abs(pos_qty)
+                        loss_per_contract = (pos_exposure_cents - mark_to_market_exit) / abs(pos_qty)
                         if loss_per_contract >= config.STOP_LOSS_CENTS:
                             sell_qty = abs(pos_qty)
                             log_event("GUARD", f"Stop-loss triggered: down {loss_per_contract:.0f}c/contract (limit {config.STOP_LOSS_CENTS}c)")
@@ -542,13 +795,15 @@ class TradingBot:
                                 self.status["last_action"] = "SL: sell order rejected"
                             return
 
-                    # Rule: Pop-and-Drop — full exit at high profit with time remaining
-                    if current_value >= config.PROFIT_TAKE_PRICE and secs_left > config.PROFIT_TAKE_MIN_SECS:
+                    # Rule: Pop-and-Drop — full exit at % profit with time remaining
+                    avg_cost = pos_exposure_cents / abs(pos_qty) if abs(pos_qty) > 0 else 0
+                    gain_pct = ((current_value - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0
+                    if gain_pct >= config.PROFIT_TAKE_PCT and secs_left > config.PROFIT_TAKE_MIN_SECS:
                         sell_qty = abs(pos_qty)
-                        log_event("TRADE", f"Profit take: {current_value}c >= {config.PROFIT_TAKE_PRICE}c target, {secs_left:.0f}s left — selling all")
+                        log_event("TRADE", f"Profit take: +{gain_pct:.0f}% gain ({current_value}c vs {avg_cost:.0f}c cost) >= {config.PROFIT_TAKE_PCT}% target, {secs_left:.0f}s left — selling all")
                         order = await self.close_position(ticker, sell_side, sell_price, sell_qty)
                         if order:
-                            self.status["last_action"] = f"TP: sold {sell_qty}x {sell_side.upper()} @ {sell_price}c"
+                            self.status["last_action"] = f"TP: sold {sell_qty}x {sell_side.upper()} @ {sell_price}c (+{gain_pct:.0f}%)"
                         else:
                             self.status["last_action"] = "TP: sell order rejected"
                         return
@@ -566,8 +821,12 @@ class TradingBot:
                         else:
                             self.status["last_action"] = "Free roll: sell order rejected"
                         return
-            else:
-                self.status["position_pnl"] = 0.0
+
+            # 6. Time guard
+            if not self._time_guard(market):
+                self.status["last_action"] = "Time guard — sleeping"
+                await self.cancel_all_orders()
+                return
 
             if not spread_ok:
                 self.status["last_action"] = "Spread too wide — holding"
@@ -666,6 +925,17 @@ class TradingBot:
             await self.cancel_all_orders()
 
             side = "yes" if action == "BUY_YES" else "no"
+
+            # Same-side guard: never place orders against an existing position
+            if my_pos:
+                pos_val = my_pos.get("position", 0) or 0
+                holding_yes = pos_val > 0
+                holding_no = pos_val < 0
+                if (holding_yes and side == "no") or (holding_no and side == "yes"):
+                    held_side = "YES" if holding_yes else "NO"
+                    log_event("GUARD", f"Same-side guard: holding {held_side}, blocked {side.upper()} order")
+                    self.status["last_action"] = f"Blocked — already holding {held_side}"
+                    return
 
             # Aggressive pricing on extreme momentum, else standard limit
             extreme_momentum = (

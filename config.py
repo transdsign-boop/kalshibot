@@ -13,14 +13,11 @@ KALSHI_DEMO_PRIVATE_KEY_PATH = os.getenv("KALSHI_DEMO_PRIVATE_KEY_PATH", "./kals
 # Active environment: "demo" or "live"
 KALSHI_ENV = os.getenv("KALSHI_ENV", "demo")
 
-# Resolved from the active environment
-KALSHI_API_KEY_ID = KALSHI_LIVE_API_KEY_ID if KALSHI_ENV == "live" else KALSHI_DEMO_API_KEY_ID
-KALSHI_API_PRIVATE_KEY_PATH = KALSHI_LIVE_PRIVATE_KEY_PATH if KALSHI_ENV == "live" else KALSHI_DEMO_PRIVATE_KEY_PATH
+# Always use live credentials — demo mode is paper trading on the live API
+KALSHI_API_KEY_ID = KALSHI_LIVE_API_KEY_ID
+KALSHI_API_PRIVATE_KEY_PATH = KALSHI_LIVE_PRIVATE_KEY_PATH
 
-HOSTS = {
-    "live": "https://api.elections.kalshi.com",
-    "demo": "https://demo-api.kalshi.co",
-}
+KALSHI_HOST = "https://api.elections.kalshi.com"
 
 # --- Anthropic ---
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -45,7 +42,7 @@ MAX_CONTRACT_PRICE = 85           # avoid buying above this (bad risk/reward)
 STOP_LOSS_CENTS = 15              # exit position if down this many cents/contract
 
 # Profit-taking
-PROFIT_TAKE_PRICE = 94            # cents — full exit when contract hits this
+PROFIT_TAKE_PCT = 50              # % gain from entry — full exit when profit exceeds this
 FREE_ROLL_PRICE = 90              # cents — sell half to lock in capital
 PROFIT_TAKE_MIN_SECS = 300        # only take full profit if >5 min remain
 HOLD_EXPIRY_SECS = 120            # don't sell in last 2 minutes — ride to settlement
@@ -54,6 +51,9 @@ HOLD_EXPIRY_SECS = 120            # don't sell in last 2 minutes — ride to set
 DELTA_THRESHOLD = 20              # USD — front-run trigger
 EXTREME_DELTA_THRESHOLD = 50      # USD — aggressive execution trigger
 ANCHOR_SECONDS_THRESHOLD = 60     # seconds — anchor defense trigger
+
+# Paper trading (demo mode uses live API but simulates trades)
+PAPER_STARTING_BALANCE = float(os.getenv("PAPER_STARTING_BALANCE", "100.0"))
 
 # Loop interval
 POLL_INTERVAL_SECONDS = 10
@@ -72,7 +72,7 @@ TUNABLE_FIELDS = {
     "MIN_CONTRACT_PRICE":   {"type": "int",   "min": 1,  "max": 55},
     "MAX_CONTRACT_PRICE":   {"type": "int",   "min": 50, "max": 99},
     "STOP_LOSS_CENTS":      {"type": "int",   "min": 0,  "max": 50},
-    "PROFIT_TAKE_PRICE":    {"type": "int",   "min": 80, "max": 99},
+    "PROFIT_TAKE_PCT":      {"type": "int",   "min": 5,  "max": 500},
     "FREE_ROLL_PRICE":      {"type": "int",   "min": 75, "max": 99},
     "PROFIT_TAKE_MIN_SECS": {"type": "int",   "min": 60, "max": 600},
     "HOLD_EXPIRY_SECS":     {"type": "int",   "min": 30, "max": 300},
@@ -80,6 +80,7 @@ TUNABLE_FIELDS = {
     "DELTA_THRESHOLD":          {"type": "int",   "min": 5,   "max": 200},
     "EXTREME_DELTA_THRESHOLD":  {"type": "int",   "min": 10,  "max": 500},
     "ANCHOR_SECONDS_THRESHOLD": {"type": "int",   "min": 15,  "max": 120},
+    "PAPER_STARTING_BALANCE":   {"type": "float", "min": 10,  "max": 100000},
 }
 
 
@@ -130,15 +131,16 @@ def restore_tunables():
 
 
 def switch_env(env: str):
-    """Switch active Kalshi environment and update resolved credentials."""
+    """Switch active Kalshi environment and update resolved credentials.
+
+    Both 'demo' (paper) and 'live' use the live Kalshi API.
+    'demo' mode simulates trades without placing real orders.
+    """
     import config as _self
     if env not in ("demo", "live"):
         raise ValueError(f"Invalid env: {env}")
     _self.KALSHI_ENV = env
-    if env == "live":
-        _self.KALSHI_API_KEY_ID = _self.KALSHI_LIVE_API_KEY_ID
-        _self.KALSHI_API_PRIVATE_KEY_PATH = _self.KALSHI_LIVE_PRIVATE_KEY_PATH
-    else:
-        _self.KALSHI_API_KEY_ID = _self.KALSHI_DEMO_API_KEY_ID
-        _self.KALSHI_API_PRIVATE_KEY_PATH = _self.KALSHI_DEMO_PRIVATE_KEY_PATH
+    # Always use live credentials — demo mode is paper trading on the live API
+    _self.KALSHI_API_KEY_ID = _self.KALSHI_LIVE_API_KEY_ID
+    _self.KALSHI_API_PRIVATE_KEY_PATH = _self.KALSHI_LIVE_PRIVATE_KEY_PATH
     return env
