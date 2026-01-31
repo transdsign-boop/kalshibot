@@ -101,6 +101,15 @@ const SETTINGS = {
     unit: 's',
     desc: 'Seconds before expiry when anchor defense activates. Projects settlement and can force exit if losing.',
   },
+  LEAD_LAG_ENABLED: {
+    label: 'Lead-Lag Signal',
+    desc: 'Enable multi-exchange lead-lag signal. Uses all 6 exchanges to detect when BTC moves but Kalshi contracts lag behind.',
+  },
+  LEAD_LAG_THRESHOLD: {
+    label: 'Lead-Lag Threshold',
+    unit: '$',
+    desc: 'How much the weighted global BTC price must differ from strike to trigger. Higher = less sensitive, fewer trades.',
+  },
 }
 
 const GROUPS = [
@@ -126,7 +135,7 @@ const GROUPS = [
   },
   {
     title: 'Alpha Engine',
-    keys: ['DELTA_THRESHOLD', 'EXTREME_DELTA_THRESHOLD', 'ANCHOR_SECONDS_THRESHOLD'],
+    keys: ['LEAD_LAG_ENABLED', 'LEAD_LAG_THRESHOLD', 'DELTA_THRESHOLD', 'EXTREME_DELTA_THRESHOLD', 'ANCHOR_SECONDS_THRESHOLD'],
   },
 ]
 
