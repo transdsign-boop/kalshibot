@@ -222,6 +222,9 @@ class AlphaMonitor:
                 })
                 symbol = cfg['symbol']
 
+                # Load markets before watching tickers
+                await exchange.load_markets()
+
                 self._exchange_connected[exchange_id] = True
                 delay = self.RECONNECT_BASE_DELAY
                 log_event("ALPHA", f"{cfg['label']} connected")
