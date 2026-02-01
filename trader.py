@@ -804,7 +804,6 @@ class TradingBot:
                     return  # Order rejected (e.g., no orderbook)
             return
 
-        current_price = price_cents
         current_order_id = order_id
         for attempt in range(1, max_retries + 1):
             await asyncio.sleep(1)
@@ -821,14 +820,38 @@ class TradingBot:
                     except Exception:
                         pass
 
-                    current_price = current_price + 1 if side == "yes" else current_price - 1
-                    current_price = max(1, min(99, current_price))
-                    retry_order = await self.place_order(ticker, side, current_price, remaining)
+                    # Refresh orderbook and escalate toward the spread
+                    live_ob = self.alpha.get_live_orderbook(ticker) if self.alpha else None
+                    ob = live_ob if live_ob else await self.fetch_orderbook(ticker)
+                    yes_orders = ob.get("yes", []) if isinstance(ob.get("yes"), list) else []
+                    no_orders = ob.get("no", []) if isinstance(ob.get("no"), list) else []
+                    cur_bid = max((p for p, q in yes_orders), default=0) if yes_orders else 0
+                    cur_ask = (100 - max((p for p, q in no_orders), default=0)) if no_orders else 100
+
+                    if side == "yes":
+                        if attempt == 1:
+                            new_price = (cur_bid + cur_ask + 1) // 2
+                        elif attempt == 2:
+                            new_price = cur_bid + ((cur_ask - cur_bid) * 2) // 3
+                        else:
+                            new_price = cur_ask
+                    else:
+                        no_bid = 100 - cur_ask
+                        no_ask = 100 - cur_bid
+                        if attempt == 1:
+                            new_price = (no_bid + no_ask + 1) // 2
+                        elif attempt == 2:
+                            new_price = no_bid + ((no_ask - no_bid) * 2) // 3
+                        else:
+                            new_price = no_ask
+
+                    new_price = max(1, min(99, new_price))
+                    retry_order = await self.place_order(ticker, side, new_price, remaining)
                     if retry_order:
                         current_order_id = retry_order.get("order_id", current_order_id)
                         qty = remaining
-                        self.status["last_action"] = f"Retry {attempt} {side.upper()} @ {current_price}c x{remaining}"
-                        log_event("ALPHA", f"Retry {attempt}/{max_retries}: {side} @ {current_price}c x{remaining}")
+                        self.status["last_action"] = f"Retry {attempt} {side.upper()} @ {new_price}c x{remaining}"
+                        log_event("ALPHA", f"Retry {attempt}/{max_retries}: {side} @ {new_price}c x{remaining} (was {price_cents}c)")
                     else:
                         return  # Order rejected
                 else:
