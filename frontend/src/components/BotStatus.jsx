@@ -23,19 +23,25 @@ export default function BotStatus({ status }) {
   if (decision === 'BUY_YES') badgeBg = 'bg-green-500/15 text-green-400'
   else if (decision === 'BUY_NO') badgeBg = 'bg-red-500/15 text-red-400'
 
-  // Position detail
-  let posLabel = '—'
+  // Position value computation
+  const bal = typeof balance === 'number' ? balance : parseFloat(balance) || 0
+  let posMarketValue = 0
+  let posQty = 0
+  let posSide = ''
+  let costPerContract = 0
+  let valuePerContract = 0
   if (active_position) {
-    const posQty = active_position.position || 0
+    const rawQty = active_position.position || 0
     const exposureCents = active_position.market_exposure || 0
-    const qty = Math.abs(posQty)
-    if (qty > 0) {
-      const costPer = (exposureCents / qty).toFixed(0)
-      const side = posQty > 0 ? 'YES' : 'NO'
-      const valuePer = posQty > 0 ? (ob.best_bid || 0) : (100 - (ob.best_ask || 100))
-      posLabel = `${qty}x ${side} @ ${costPer}c (now ${valuePer}c)`
-    }
+    posQty = Math.abs(rawQty)
+    posSide = rawQty > 0 ? 'YES' : 'NO'
+    costPerContract = posQty > 0 ? exposureCents / posQty : 0
+    valuePerContract = rawQty > 0 ? (ob.best_bid || 0) : (100 - (ob.best_ask || 100))
+    posMarketValue = valuePerContract * posQty / 100 // dollars
   }
+  const totalAccount = bal + posMarketValue
+  const startBal = totalAccount - pnl
+  const pnlPct = startBal > 0 ? (pnl / startBal) * 100 : 0
 
   return (
     <div className="card p-4 mb-4">
@@ -81,20 +87,38 @@ export default function BotStatus({ status }) {
         </div>
       )}
 
-      {/* P&L + metrics row */}
-      <div className="flex items-center gap-3 pt-2 border-t border-white/[0.04]">
-        <span className={`text-lg font-bold font-mono ${pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-          {pnl >= 0 ? '+' : ''}{pnl.toFixed(2)}
-        </span>
-        <div className="flex items-center gap-3 text-[11px] font-mono text-gray-500">
-          <span>${typeof balance === 'number' ? balance.toFixed(2) : balance}</span>
-          {active_position && (
-            <span className={posPnl >= 0 ? 'text-green-400/70' : 'text-red-400/70'}>
-              pos {posPnl >= 0 ? '+' : ''}{posPnl.toFixed(2)}
+      {/* Account overview */}
+      <div className="pt-2 border-t border-white/[0.04]">
+        {/* Row 1: Total account + P&L + % */}
+        <div className="flex items-baseline justify-between">
+          <div className="flex items-baseline gap-1.5">
+            <span className="text-2xl font-bold font-mono text-gray-100">
+              ${totalAccount.toFixed(2)}
             </span>
-          )}
-          {active_position && (
-            <span className="text-gray-600 truncate">{posLabel}</span>
+            <span className="text-[10px] text-gray-600">total</span>
+          </div>
+          <div className="flex items-baseline gap-2">
+            <span className={`text-lg font-bold font-mono ${pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+              {pnl >= 0 ? '+' : ''}{pnl.toFixed(2)}
+            </span>
+            <span className={`text-sm font-semibold font-mono ${pnlPct >= 0 ? 'text-green-400/70' : 'text-red-400/70'}`}>
+              {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(1)}%
+            </span>
+          </div>
+        </div>
+
+        {/* Row 2: Cash + position breakdown */}
+        <div className="flex items-center gap-3 mt-1 text-[11px] font-mono text-gray-500">
+          <span>${bal.toFixed(2)} cash</span>
+          {posQty > 0 && (
+            <>
+              <span className={posPnl >= 0 ? 'text-green-400/70' : 'text-red-400/70'}>
+                ${posMarketValue.toFixed(2)} position
+              </span>
+              <span className="text-gray-600">
+                {posQty}x {posSide} @ {costPerContract.toFixed(0)}c → {valuePerContract}c
+              </span>
+            </>
           )}
         </div>
       </div>
