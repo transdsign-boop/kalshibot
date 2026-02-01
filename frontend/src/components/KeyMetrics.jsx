@@ -4,9 +4,11 @@ function fmt(value) {
 }
 
 export default function KeyMetrics({ status }) {
-  const { balance, day_pnl, position_pnl, position, orderbook, active_position } = status
+  const { balance, day_pnl, day_pnl_pct, position_pnl, position_pnl_pct, position, orderbook, active_position } = status
   const pnl = fmt(day_pnl)
+  const pnlPct = fmt(day_pnl_pct)
   const posPnl = fmt(position_pnl)
+  const posPnlPct = fmt(position_pnl_pct)
   const ob = orderbook || {}
 
   // Compute per-contract cost and current value for position context
@@ -31,12 +33,13 @@ export default function KeyMetrics({ status }) {
         label="P&L"
         value={`${pnl >= 0 ? '+' : ''}$${Math.abs(pnl).toFixed(2)}`}
         color={pnl > 0 ? 'text-green-400' : pnl < 0 ? 'text-red-400' : 'text-gray-400'}
+        detail={`${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`}
       />
       <Metric
         label="Pos P&L"
         value={`${posPnl >= 0 ? '+' : ''}$${Math.abs(posPnl).toFixed(2)}`}
         color={posPnl > 0 ? 'text-green-400' : posPnl < 0 ? 'text-red-400' : 'text-gray-500'}
-        detail={posDetail}
+        detail={posPnlPct !== 0 ? `${posPnlPct >= 0 ? '+' : ''}${posPnlPct.toFixed(1)}% | ${posDetail}` : posDetail}
       />
       <Metric label="Position" value={position} small />
     </div>

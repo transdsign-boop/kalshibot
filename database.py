@@ -155,7 +155,7 @@ def get_trades_with_pnl(limit: int = 50) -> dict:
         if t["action"] == "BUY":
             m["buy_cost"] += cost
             m["has_buy"] = True
-        elif t["action"] in ("SELL", "SETTLED"):
+        elif t["action"] in ("SELL", "SETTLED", "SL", "TP", "SETTLE"):
             m["sell_proceeds"] += cost
             m["has_sell"] = True
 
@@ -185,7 +185,7 @@ def get_trades_with_pnl(limit: int = 50) -> dict:
     # Attach pnl to sell/settled rows
     for t in trades:
         mid = t["market_id"]
-        if t["action"] in ("SELL", "SETTLED") and mid in market_pnl:
+        if t["action"] in ("SELL", "SETTLED", "SL", "TP", "SETTLE") and mid in market_pnl:
             t["pnl"] = market_pnl[mid]
         else:
             t["pnl"] = None

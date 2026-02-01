@@ -57,6 +57,7 @@ async def api_status():
 
     # Calculate fresh position P&L on every request for live updates
     position_pnl = 0.0
+    position_pnl_pct = 0.0
     if pos:
         pos_val = pos.get("position", 0) or 0
         exposure = pos.get("market_exposure", 0) or 0
@@ -78,12 +79,22 @@ async def api_status():
                 # Long NO: current value = (100 - best_ask) × |qty|
                 mark_to_market = (100 - best_ask) * abs(pos_val)
             position_pnl = (mark_to_market - exposure) / 100.0
+            # Calculate percentage gain
+            if exposure > 0:
+                position_pnl_pct = (position_pnl / (exposure / 100.0)) * 100.0
+
+    # Calculate day P&L percentage
+    day_pnl = bot.status.get("day_pnl", 0.0)
+    starting_balance = config.PAPER_STARTING_BALANCE if bot.paper_mode else (bot._start_balance or 100.0)
+    day_pnl_pct = (day_pnl / starting_balance * 100.0) if starting_balance > 0 else 0.0
 
     return {
         "running": bot.status["running"],
         "balance": f"${bot.status['balance']:.2f}",
-        "day_pnl": bot.status.get("day_pnl", 0.0),
+        "day_pnl": day_pnl,
+        "day_pnl_pct": day_pnl_pct,
         "position_pnl": position_pnl,  # Fresh calculation every request
+        "position_pnl_pct": position_pnl_pct
         "position": pos_label,
         "active_position": pos,
         "market": bot.status.get("current_market") or "—",
