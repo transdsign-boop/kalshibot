@@ -433,8 +433,11 @@ class TradingBot:
 
         filled_qty, avg_price, fills = self._simulate_fill(ob, "buy", side, price_cents, quantity)
         if filled_qty == 0:
-            log_event("SIM", f"[PAPER] No liquidity for {side.upper()} @ {price_cents}c on {ticker}")
-            return None
+            # No crossing fill — order rests on the book (same as live Kalshi behavior).
+            # Return a "resting" order so the retry logic can fire and reprice.
+            order_id = f"paper-{int(time.time() * 1000)}"
+            log_event("SIM", f"[PAPER] Order resting: {side.upper()} @ {price_cents}c x{quantity} on {ticker} (no crossing liquidity)")
+            return {"order_id": order_id, "status": "resting", "filled_count": 0, "remaining_count": quantity}
 
         cost_cents = avg_price * filled_qty
         cost_dollars = cost_cents / 100.0
