@@ -92,7 +92,7 @@ RULE_MIN_CONFIDENCE = float(os.getenv("RULE_MIN_CONFIDENCE", "0.6"))         # m
 
 # Paper trading (demo mode uses live API but simulates trades)
 PAPER_STARTING_BALANCE = float(os.getenv("PAPER_STARTING_BALANCE", "100.0"))
-PAPER_FILL_FRACTION = float(os.getenv("PAPER_FILL_FRACTION", "0.5"))  # fraction of book depth you capture (competition simulation)
+PAPER_FILL_FRACTION = float(os.getenv("PAPER_FILL_FRACTION", "1.0"))  # fraction of book depth filled (1.0 = full depth, crossing orders fill against all resting liquidity)
 
 # Loop interval
 POLL_INTERVAL_SECONDS = 10
