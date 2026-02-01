@@ -249,12 +249,7 @@ class TradingBot:
         return balance_cents / 100.0
 
     async def fetch_active_market(self) -> dict | None:
-        """Find the currently active KXBTC15M market.
-
-        When multiple contracts are open (overlap during settlement), prefer
-        the newer contract that still has tradeable time rather than the old
-        one that is about to expire.
-        """
+        """Find the currently active KXBTC15M market."""
         data = await self._get(
             "/markets",
             params={
@@ -267,8 +262,9 @@ class TradingBot:
         if not markets:
             return None
 
+        # Pick the market closest to closing that is still tradeable
         now = datetime.now(timezone.utc)
-        candidates = []
+        best = None
         for m in markets:
             close_str = m.get("close_time") or m.get("expected_expiration_time")
             if not close_str:
@@ -277,28 +273,9 @@ class TradingBot:
             secs_left = (close_time - now).total_seconds()
             if secs_left > 0:
                 m["_seconds_to_close"] = secs_left
-                candidates.append(m)
-
-        if not candidates:
-            return None
-
-        # Sort by time remaining (ascending — soonest to close first)
-        candidates.sort(key=lambda m: m["_seconds_to_close"])
-
-        # If only one market, use it
-        if len(candidates) == 1:
-            return candidates[0]
-
-        # Multiple contracts open (overlap window). If the soonest-to-close
-        # contract is too close to expiry to trade, skip to the next one.
-        # This lets us start trading the new contract immediately instead of
-        # waiting for the old one to settle.
-        if candidates[0]["_seconds_to_close"] < config.MIN_SECONDS_TO_CLOSE:
-            log_event("INFO", f"Skipping expiring contract {candidates[0].get('ticker', '?')} ({candidates[0]['_seconds_to_close']:.0f}s left), switching to {candidates[1].get('ticker', '?')}")
-            return candidates[1]
-
-        # Otherwise pick the soonest (normal behavior)
-        return candidates[0]
+                if best is None or secs_left < best["_seconds_to_close"]:
+                    best = m
+        return best
 
     async def fetch_orderbook(self, ticker: str) -> dict:
         data = await self._get(f"/markets/{ticker}/orderbook")
