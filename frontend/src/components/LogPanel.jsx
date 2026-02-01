@@ -15,10 +15,11 @@ export default function LogPanel({ logs }) {
   return (
     <div className="log-box bg-black/20 rounded-lg p-3 text-gray-400">
       {logs.map((l, i) => {
+        const isError = l.level === 'ERROR'
         const color = LEVEL_COLORS[l.level] || 'text-gray-500'
         return (
-          <div key={i} className={color}>
-            <span className="text-gray-600">{toPacificSec(l.ts)}</span> [{l.level}] {l.message}
+          <div key={i} className={`${color}${isError ? ' bg-red-500/10 rounded px-1 -mx-1' : ''}`}>
+            <span className="text-gray-600">{toPacificSec(l.ts)}</span>{isError ? ' \u{1F6A9}' : ''} [{l.level}] {l.message}
           </div>
         )
       })}
