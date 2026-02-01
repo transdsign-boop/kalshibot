@@ -746,7 +746,12 @@ class TradingBot:
 
     async def _wait_and_retry(self, ticker: str, order_id: str, side: str,
                                price_cents: int, qty: int, initial_order: dict | None = None):
-        """Chase fills with up to 3 retries, each 1c more aggressive at 1s intervals."""
+        """Chase fills with up to 3 retries, escalating toward the spread.
+
+        Paper mode: retries escalate toward the ask — midpoint, then 2/3,
+        then cross the spread. Standard +1c bumps can never cross wide
+        spreads, but in reality resting orders get filled by counterparties.
+        """
         max_retries = 3
 
         if self.paper_mode:
@@ -754,7 +759,6 @@ class TradingBot:
             if remaining <= 0:
                 return  # Fully filled — nothing to retry
 
-            current_price = price_cents
             for attempt in range(1, max_retries + 1):
                 await asyncio.sleep(1)
 
@@ -762,14 +766,38 @@ class TradingBot:
                 live_ob = self.alpha.get_live_orderbook(ticker) if self.alpha else None
                 self._paper_orderbook = live_ob if live_ob else await self.fetch_orderbook(ticker)
 
-                current_price = current_price + 1 if side == "yes" else current_price - 1
-                current_price = max(1, min(99, current_price))
-                log_event("SIM", f"[PAPER] Retry {attempt}/{max_retries}: {remaining}x {side.upper()} @ {current_price}c (was {price_cents}c)")
-                retry_order = await self.place_order(ticker, side, current_price, remaining)
+                ob = self._paper_orderbook or {}
+                yes_orders = ob.get("yes", [])
+                no_orders = ob.get("no", [])
+                cur_bid = max((p for p, q in yes_orders), default=0) if yes_orders else 0
+                cur_ask = (100 - max((p for p, q in no_orders), default=0)) if no_orders else 100
+
+                # Escalate: retry 1 → midpoint, retry 2 → 2/3 toward ask, retry 3 → cross spread
+                if side == "yes":
+                    if attempt == 1:
+                        new_price = (cur_bid + cur_ask + 1) // 2      # midpoint
+                    elif attempt == 2:
+                        new_price = cur_bid + ((cur_ask - cur_bid) * 2) // 3  # 2/3
+                    else:
+                        new_price = cur_ask                           # cross spread
+                else:
+                    # For NO: work in no-price space (100 - yes prices)
+                    no_bid = 100 - cur_ask  # best NO bid
+                    no_ask = 100 - cur_bid  # best NO ask
+                    if attempt == 1:
+                        new_price = (no_bid + no_ask + 1) // 2
+                    elif attempt == 2:
+                        new_price = no_bid + ((no_ask - no_bid) * 2) // 3
+                    else:
+                        new_price = no_ask
+
+                new_price = max(1, min(99, new_price))
+                log_event("SIM", f"[PAPER] Retry {attempt}/{max_retries}: {remaining}x {side.upper()} @ {new_price}c (was {price_cents}c)")
+                retry_order = await self.place_order(ticker, side, new_price, remaining)
                 if retry_order:
                     filled = retry_order.get("filled_count", 0)
                     remaining = retry_order.get("remaining_count", remaining)
-                    self.status["last_action"] = f"Retry {attempt} {side.upper()} @ {current_price}c x{filled} filled"
+                    self.status["last_action"] = f"Retry {attempt} {side.upper()} @ {new_price}c x{filled} filled"
                     if remaining <= 0:
                         return  # Fully filled
                 else:
