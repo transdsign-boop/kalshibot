@@ -17,10 +17,6 @@ primary_region = 'gru'
   min_machines_running = 1
   processes = ['app']
 
-[mounts]
-  source = 'kalshibot_data'
-  destination = '/data'
-
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
