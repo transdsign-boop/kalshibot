@@ -83,6 +83,7 @@ class TradingBot:
         self._paper_trades: list[dict] = []
         self._last_paper_ticker: str | None = None
         self._paper_orderbook: dict | None = None  # latest orderbook snapshot for realistic paper fills
+        self._estimated_strikes: dict[str, float] = {}  # ticker -> BTC price when first seen (fallback when Kalshi says TBD)
 
         # Live state exposed to the dashboard
         self.status: dict[str, Any] = {
@@ -698,14 +699,22 @@ class TradingBot:
 
         Tries structured fields first (floor_strike / strike_price),
         then falls back to parsing dollar amounts from yes_sub_title or title.
+        If Kalshi returns 'TBD', uses the live BTC price captured when the
+        contract was first seen as an estimated strike.
         """
+        ticker = market.get("ticker", "")
+
         strike = market.get("floor_strike") or market.get("strike_price")
         if strike:
             try:
                 val = float(strike)
                 # BTC strikes are already in dollars (e.g., 83873.08).
                 # Small values (<1000) might be cents from other market types.
-                return val if val > 1000 else val / 100.0
+                result = val if val > 1000 else val / 100.0
+                # Cache the real strike (replaces any estimate)
+                if ticker:
+                    self._estimated_strikes[ticker] = result
+                return result
             except (ValueError, TypeError):
                 pass
 
@@ -716,9 +725,25 @@ class TradingBot:
             match = re.search(r'\$([0-9,.]+)', text)
             if match:
                 try:
-                    return float(match.group(1).replace(",", ""))
+                    result = float(match.group(1).replace(",", ""))
+                    if ticker:
+                        self._estimated_strikes[ticker] = result
+                    return result
                 except ValueError:
                     pass
+
+        # Kalshi says "TBD" — use estimated strike from BTC price at first sight
+        if ticker and ticker in self._estimated_strikes:
+            return self._estimated_strikes[ticker]
+
+        # Last resort: capture current BTC price as estimated strike
+        if ticker and self.alpha:
+            btc_price = self.alpha.get_weighted_global_price()
+            if btc_price and btc_price > 0:
+                self._estimated_strikes[ticker] = btc_price
+                log_event("INFO", f"Strike TBD for {ticker} — using live BTC ${btc_price:.2f} as estimated strike")
+                return btc_price
+
         return None
 
     async def _wait_and_retry(self, ticker: str, order_id: str, side: str,
