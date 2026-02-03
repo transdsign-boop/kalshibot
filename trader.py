@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 import config
 from agent import MarketAgent
-from database import init_db, log_event, record_trade, record_decision, record_snapshot, get_entry_snapshot, get_unsettled_entry, get_setting, set_setting
+from database import init_db, log_event, record_trade, record_decision, record_snapshot, get_entry_snapshot, get_unsettled_entry, get_setting, set_setting, set_live_market_pnl
 
 
 def _load_private_key():
@@ -773,8 +773,90 @@ class TradingBot:
                 })
             except Exception:
                 pass
+
+            # Auto-reconcile to get actual P&L from Kalshi fills
+            await self._reconcile_market(old_ticker)
+
         except Exception as exc:
             log_event("ERROR", f"[LIVE] Settlement recording failed for {old_ticker}: {exc}")
+
+    async def _reconcile_market(self, ticker: str):
+        """Fetch actual fills from Kalshi and update live_market_pnl with accurate data."""
+        try:
+            # Fetch fills for this market
+            fills = await self._get("/portfolio/fills", params={"ticker": ticker, "limit": 100})
+            fill_list = fills.get("fills", [])
+            if not fill_list:
+                return
+
+            # Calculate P&L from fills
+            buy_cost_cents = 0
+            sell_revenue_cents = 0
+            total_fees_cents = 0
+            primary_side = None
+            remaining_yes = 0
+            remaining_no = 0
+
+            for f in fill_list:
+                side = f.get("side", "").lower()
+                action = f.get("action", "").lower()
+                count = f.get("count", 0)
+                price_cents = int(float(f.get("yes_price", 0)) * 100)
+                fee_str = f.get("fee_cost", "0")
+                fee_dollars = float(fee_str) if fee_str else 0
+                total_fees_cents += fee_dollars * 100
+
+                if action == "buy":
+                    if side == "yes":
+                        buy_cost_cents += price_cents * count
+                        remaining_yes += count
+                        if primary_side is None:
+                            primary_side = "yes"
+                    else:
+                        buy_cost_cents += (100 - price_cents) * count
+                        remaining_no += count
+                        if primary_side is None:
+                            primary_side = "no"
+                elif action == "sell":
+                    if side == "yes":
+                        sell_revenue_cents += price_cents * count
+                        remaining_yes -= count
+                    else:
+                        sell_revenue_cents += (100 - price_cents) * count
+                        remaining_no -= count
+
+            # Fetch market result for settlement calculation
+            try:
+                mkt = await self._get(f"/markets/{ticker}")
+                market_data = mkt.get("market", mkt)
+                result = market_data.get("result", "").lower()
+            except Exception:
+                result = ""
+
+            # Calculate settlement payout
+            settle_cents = 0
+            if result == "yes":
+                settle_cents = remaining_yes * 100
+            elif result == "no":
+                settle_cents = remaining_no * 100
+
+            total_revenue_cents = sell_revenue_cents + settle_cents
+            pnl_cents = total_revenue_cents - buy_cost_cents
+            outcome = "win" if pnl_cents > 0 else "loss" if pnl_cents < 0 else "break-even"
+
+            # Store actual P&L
+            set_live_market_pnl(
+                ticker,
+                pnl_cents,
+                outcome,
+                total_cost_cents=buy_cost_cents,
+                total_revenue_cents=total_revenue_cents,
+                fees_cents=total_fees_cents,
+            )
+            log_event("INFO", f"[LIVE] Reconciled {ticker}: cost=${buy_cost_cents/100:.2f}, revenue=${total_revenue_cents/100:.2f}, fees=${total_fees_cents/100:.2f}, P&L=${pnl_cents/100:+.2f}")
+
+        except Exception as exc:
+            log_event("ERROR", f"[LIVE] Auto-reconcile failed for {ticker}: {exc}")
 
     # ------------------------------------------------------------------
     # Safety layer ("reflexes")
