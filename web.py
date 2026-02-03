@@ -459,17 +459,18 @@ async def reconcile_trades(since_utc: str = "2026-01-01T00:00:00Z"):
 
             # Add SETTLE entry for remaining position
             if mkt["result"] and (mkt["remaining"]["yes"] > 0 or mkt["remaining"]["no"] > 0):
-                # Extract settle time from ticker (e.g., KXBTC15M-26FEB030900-00 -> Feb 3 09:00 UTC)
+                # Extract settle time from ticker (e.g., KXBTC15M-26FEB030900-00 -> Feb 3 09:00 UTC 2026)
                 settle_ts = datetime.now(timezone.utc).isoformat()  # fallback
                 try:
                     import re
+                    # Format: -YYMMMDDHHNN- where YY=year, MMM=month, DD=day, HH=hour, NN=minute
                     match = re.search(r"-(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})-", ticker)
                     if match:
-                        day, mon_str, hr, mn, _ = match.groups()
+                        yr, mon_str, day, hr, mn = match.groups()
                         months = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
                                   "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
                         mon = months.get(mon_str, 1)
-                        year = 2026 if mon >= datetime.now().month else 2025
+                        year = 2000 + int(yr)
                         settle_dt = datetime(year, mon, int(day), int(hr), int(mn), 0, tzinfo=timezone.utc)
                         settle_ts = settle_dt.isoformat()
                 except Exception:
