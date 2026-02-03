@@ -10,11 +10,13 @@ import Collapsible from './components/Collapsible'
 import ChatPanel from './components/ChatPanel'
 import ConfigPanel from './components/ConfigPanel'
 import LogPanel from './components/LogPanel'
+import AnalyticsPanel from './components/AnalyticsPanel'
 
 export default function App() {
   const { data: status, refresh: refreshStatus } = usePolling(fetchStatus, 2000)
   const { data: logs } = usePolling(fetchLogs, 3000)
-  const { data: tradeData } = usePolling(fetchTrades, 5000)
+  const tradeMode = status?.paper_mode ? 'paper' : 'live'
+  const { data: tradeData } = usePolling(() => fetchTrades(tradeMode), 5000)
 
   if (!status) {
     return (
@@ -34,9 +36,12 @@ export default function App() {
       <BotStatus status={status} />
       <ExchangeMonitor status={status} />
       <AlphaDashboard status={status} />
-      <TradeLog tradeData={tradeData} />
+      <TradeLog tradeData={tradeData} mode={tradeMode} />
 
       <div className="mt-6 space-y-2">
+        <Collapsible title="Trade Analytics" badge={tradeData?.summary?.total_trades ? `${tradeData.summary.total_trades} trades` : null}>
+          <AnalyticsPanel mode={tradeMode} />
+        </Collapsible>
         <Collapsible title="Chat with Agent">
           <ChatPanel />
         </Collapsible>

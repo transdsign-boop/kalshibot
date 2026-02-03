@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { toPacific } from '../utils/time'
 
-export default function TradeLog({ tradeData }) {
+export default function TradeLog({ tradeData, mode }) {
   if (!tradeData) return null
   const { trades, summary } = tradeData
   if (!trades || trades.length === 0) {
@@ -25,7 +25,7 @@ export default function TradeLog({ tradeData }) {
       groups.push(group)
     }
     groupMap[mid].entries.push(t)
-    if (['SELL', 'SETTLED', 'SETTLE', 'SL', 'TP'].includes(t.action)) {
+    if (['SELL', 'SETTLED', 'SETTLE', 'SL', 'TP', 'EDGE'].includes(t.action)) {
       groupMap[mid].settled = t
     }
   }
@@ -34,7 +34,14 @@ export default function TradeLog({ tradeData }) {
     <div className="card p-4 mb-4">
       {/* Summary bar */}
       <div className="flex items-center justify-between mb-3">
-        <p className="text-xs font-medium text-gray-400">Trade Log</p>
+        <div className="flex items-center gap-2">
+          <p className="text-xs font-medium text-gray-400">Trade Log</p>
+          {mode && (
+            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${mode === 'live' ? 'bg-green-500/15 text-green-400' : 'bg-amber-500/15 text-amber-400'}`}>
+              {mode.toUpperCase()}
+            </span>
+          )}
+        </div>
         <div className="flex items-center gap-3 text-[10px] font-mono">
           <span className="text-gray-500">
             {total_trades} trade{total_trades !== 1 ? 's' : ''}

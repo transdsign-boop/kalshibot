@@ -62,7 +62,6 @@ MARKET_SERIES = "KXBTC15M"
 # Safety thresholds
 MIN_SECONDS_TO_CLOSE = 90
 MAX_SPREAD_CENTS = 25
-MIN_AGENT_CONFIDENCE = 0.75
 MIN_CONTRACT_PRICE = 5
 MAX_CONTRACT_PRICE = 85           # avoid buying above this (bad risk/reward)
 STOP_LOSS_CENTS = 15              # exit position if down this many cents/contract
@@ -73,6 +72,13 @@ PROFIT_TAKE_PCT = 50              # % gain from entry — full exit when profit 
 FREE_ROLL_PRICE = 90              # cents — sell half to lock in capital
 PROFIT_TAKE_MIN_SECS = 300        # only take full profit if >5 min remain
 HOLD_EXPIRY_SECS = 120            # don't sell in last 2 minutes — ride to settlement
+
+# Edge-based exit (exit when edge evaporates, re-enter when new edge appears)
+EDGE_EXIT_ENABLED = os.getenv("EDGE_EXIT_ENABLED", "true").lower() == "true"
+EDGE_EXIT_THRESHOLD_CENTS = int(os.getenv("EDGE_EXIT_THRESHOLD_CENTS", "2"))    # remaining edge threshold (scaled by time_factor)
+EDGE_EXIT_MIN_HOLD_SECS = int(os.getenv("EDGE_EXIT_MIN_HOLD_SECS", "30"))      # min hold before edge-exit can fire
+EDGE_EXIT_COOLDOWN_SECS = int(os.getenv("EDGE_EXIT_COOLDOWN_SECS", "30"))      # cooldown before re-entry after edge-exit
+REENTRY_EDGE_PREMIUM = int(os.getenv("REENTRY_EDGE_PREMIUM", "3"))             # extra edge (c) required for re-entry
 
 # Alpha Engine thresholds
 DELTA_THRESHOLD = 20              # USD — front-run trigger (momentum deviation)
@@ -107,10 +113,9 @@ TUNABLE_FIELDS = {
     "MAX_DAILY_LOSS_PCT":   {"type": "float", "min": 1,   "max": 100},
     "MIN_SECONDS_TO_CLOSE": {"type": "int",   "min": 30, "max": 600},
     "MAX_SPREAD_CENTS":     {"type": "int",   "min": 1,  "max": 100},
-    "MIN_AGENT_CONFIDENCE": {"type": "float", "min": 0,  "max": 1},
     "MIN_CONTRACT_PRICE":   {"type": "int",   "min": 1,  "max": 55},
     "MAX_CONTRACT_PRICE":   {"type": "int",   "min": 50, "max": 99},
-    "STOP_LOSS_CENTS":      {"type": "int",   "min": 0,  "max": 50},
+    "STOP_LOSS_CENTS":      {"type": "int",   "min": 0,  "max": 99},
     "HIT_RUN_PCT":          {"type": "float", "min": 0,  "max": 500},
     "PROFIT_TAKE_PCT":      {"type": "int",   "min": 5,  "max": 500},
     "FREE_ROLL_PRICE":      {"type": "int",   "min": 75, "max": 99},
@@ -129,6 +134,11 @@ TUNABLE_FIELDS = {
     "TREND_FOLLOW_VELOCITY":    {"type": "float", "min": 0.5, "max": 20.0},
     "RULE_SIT_OUT_LOW_VOL":     {"type": "bool"},
     "RULE_MIN_CONFIDENCE":      {"type": "float", "min": 0.3, "max": 0.95},
+    "EDGE_EXIT_ENABLED":        {"type": "bool"},
+    "EDGE_EXIT_THRESHOLD_CENTS":{"type": "int",   "min": 0,  "max": 15},
+    "EDGE_EXIT_MIN_HOLD_SECS":  {"type": "int",   "min": 10, "max": 120},
+    "EDGE_EXIT_COOLDOWN_SECS":  {"type": "int",   "min": 10, "max": 120},
+    "REENTRY_EDGE_PREMIUM":     {"type": "int",   "min": 0,  "max": 15},
     "PAPER_STARTING_BALANCE":   {"type": "float", "min": 10,  "max": 100000},
     "PAPER_FILL_FRACTION":      {"type": "float", "min": 0.05, "max": 1.0},
 }

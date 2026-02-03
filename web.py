@@ -15,7 +15,7 @@ import config
 _ob_cache: dict = {"ticker": "", "data": None, "ts": 0.0}
 _OB_CACHE_TTL = 2.0  # seconds
 from config import get_tunables, set_tunables, restore_tunables, TUNABLE_FIELDS
-from database import init_db, get_recent_logs, get_latest_decision, get_todays_trades, get_trades_with_pnl, get_setting, set_setting
+from database import init_db, get_recent_logs, get_latest_decision, get_todays_trades, get_trades_with_pnl, get_setting, set_setting, get_all_unsettled_live_entries, backfill_buy_trades_from_snapshots, get_db
 from alpha_engine import AlphaMonitor
 from trader import TradingBot
 
@@ -173,7 +173,7 @@ async def api_status():
 
 
 def _patch_dashboard(db: dict | None, best_bid: int, best_ask: int) -> dict | None:
-    """Patch dashboard with live orderbook data so spread guard stays fresh."""
+    """Patch dashboard with live data so guards/exits always reflect current config."""
     if not db:
         return db
     # Shallow copy to avoid mutating bot.status
@@ -184,6 +184,25 @@ def _patch_dashboard(db: dict | None, best_bid: int, best_ask: int) -> dict | No
         if guards.get("spread"):
             guards["spread"] = {**guards["spread"], "value": spread_val, "blocked": spread_val > config.MAX_SPREAD_CENTS}
         db["guards"] = guards
+    # Patch exit rule thresholds with current config values
+    if db.get("exits"):
+        exits = {**db["exits"]}
+        if exits.get("stop_loss"):
+            exits["stop_loss"] = {**exits["stop_loss"], "threshold": config.STOP_LOSS_CENTS}
+        if exits.get("hit_and_run"):
+            exits["hit_and_run"] = {**exits["hit_and_run"], "threshold": config.HIT_RUN_PCT, "enabled": config.HIT_RUN_PCT > 0}
+        if exits.get("profit_take"):
+            exits["profit_take"] = {**exits["profit_take"], "threshold": config.PROFIT_TAKE_PCT}
+        if exits.get("free_roll"):
+            exits["free_roll"] = {**exits["free_roll"], "threshold": config.FREE_ROLL_PRICE}
+        if exits.get("edge_exit"):
+            exits["edge_exit"] = {**exits["edge_exit"], "enabled": config.EDGE_EXIT_ENABLED, "min_hold": config.EDGE_EXIT_MIN_HOLD_SECS}
+        db["exits"] = exits
+    # Patch edge-exit config values
+    db["edge_exit_enabled"] = config.EDGE_EXIT_ENABLED
+    db["edge_exit_threshold"] = config.EDGE_EXIT_THRESHOLD_CENTS
+    db["edge_exit_cooldown"] = config.EDGE_EXIT_COOLDOWN_SECS
+    db["reentry_edge_premium"] = config.REENTRY_EDGE_PREMIUM
     return db
 
 
@@ -199,8 +218,298 @@ async def api_logs():
 
 
 @app.get("/api/trades")
-async def api_trades():
-    return get_trades_with_pnl()
+async def api_trades(mode: str = ""):
+    return get_trades_with_pnl(mode=mode)
+
+
+@app.get("/api/analytics")
+async def api_analytics(mode: str = ""):
+    from analytics import compute_analytics
+    return compute_analytics(mode=mode)
+
+
+class ApplySuggestionRequest(BaseModel):
+    param: str
+    value: float | int | bool | str
+
+
+@app.post("/api/analytics/apply")
+async def apply_suggestion(req: ApplySuggestionRequest):
+    if req.param not in TUNABLE_FIELDS:
+        return {"ok": False, "msg": f"Unknown parameter: {req.param}"}
+    applied = set_tunables({req.param: req.value})
+    if applied:
+        from database import log_event
+        log_event("CONFIG", f"Analytics suggestion applied: {req.param} → {req.value}")
+        return {"ok": True, "applied": applied}
+    return {"ok": False, "msg": "Failed to apply"}
+
+
+@app.post("/api/backfill/settlements")
+async def backfill_settlements():
+    """One-time backfill: find all unsettled live trades and query Kalshi for results."""
+    unsettled = get_all_unsettled_live_entries()
+    if not unsettled:
+        return {"ok": True, "msg": "No unsettled live trades found", "settled": 0}
+    results = []
+    for entry in unsettled:
+        ticker = entry["market_id"]
+        try:
+            await bot._settle_live_positions(ticker)
+            results.append({"ticker": ticker, "status": "settled"})
+        except Exception as exc:
+            results.append({"ticker": ticker, "status": "error", "error": str(exc)})
+    # Also backfill BUY records so PnL round-trips work
+    buy_backfilled = backfill_buy_trades_from_snapshots()
+    return {
+        "ok": True,
+        "settled": len([r for r in results if r["status"] == "settled"]),
+        "buy_backfilled": buy_backfilled,
+        "results": results,
+    }
+
+
+@app.post("/api/backfill/buys")
+async def backfill_buys():
+    """Backfill missing BUY records in trades table from snapshots."""
+    backfilled = backfill_buy_trades_from_snapshots()
+    return {"ok": True, "backfilled": backfilled, "count": len(backfilled)}
+
+
+@app.get("/api/kalshi/fills")
+async def kalshi_fills(since: str = ""):
+    """Query Kalshi for actual fills since a given ISO timestamp."""
+    params = {"limit": 100}
+    if since:
+        params["min_ts"] = since
+    try:
+        data = await bot._get("/portfolio/fills", params=params)
+        return data
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@app.post("/api/reconcile")
+async def reconcile_trades(since_utc: str = "2026-02-02T20:00:00Z"):
+    """Reconcile trade log with actual Kalshi fills.
+
+    Fetches all fills from Kalshi, queries market results for expired markets,
+    rebuilds the trades table with correct data.
+    """
+    from datetime import datetime, timezone
+    from database import log_event
+    from itertools import chain
+    cutoff = datetime.fromisoformat(since_utc.replace("Z", "+00:00"))
+
+    # 1. Fetch all Kalshi fills (paginated)
+    all_fills = []
+    cursor = None
+    for _ in range(10):  # max 10 pages
+        params = {"limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            data = await bot._get("/portfolio/fills", params=params)
+        except Exception as exc:
+            return {"error": f"Failed to fetch fills: {exc}"}
+        fills = data.get("fills", [])
+        if not fills:
+            break
+        all_fills.extend(fills)
+        cursor = data.get("cursor")
+        # Stop if oldest fill is before cutoff
+        oldest = datetime.fromisoformat(fills[-1]["created_time"].replace("Z", "+00:00"))
+        if oldest < cutoff:
+            break
+        if not cursor:
+            break
+
+    # Filter to fills since cutoff, only KXBTC15M markets
+    recent = [
+        f for f in all_fills
+        if f["ticker"].startswith("KXBTC15M-")
+        and datetime.fromisoformat(f["created_time"].replace("Z", "+00:00")) >= cutoff
+    ]
+
+    # 2. Group fills by market
+    markets: dict[str, list] = {}
+    for f in recent:
+        t = f["ticker"]
+        if t not in markets:
+            markets[t] = []
+        markets[t].append(f)
+
+    # 3. For each market: compute position, cost, and query result
+    results = []
+    for ticker, fills in sorted(markets.items()):
+        fills.sort(key=lambda x: x["created_time"])
+
+        # Track position and cash flows
+        yes_bought = 0
+        no_bought = 0
+        total_cost_cents = 0  # cash out
+        sell_fills_detail = []
+
+        for f in fills:
+            if f["action"] == "buy":
+                if f["side"] == "yes":
+                    yes_bought += f["count"]
+                    total_cost_cents += f["count"] * f["yes_price"]
+                else:
+                    no_bought += f["count"]
+                    total_cost_cents += f["count"] * f["no_price"]
+            elif f["action"] == "sell":
+                sell_fills_detail.append(f)
+
+        # Process sells: track what was sold on each side
+        yes_sold = sum(f["count"] for f in sell_fills_detail if f["side"] == "yes")
+        no_sold = sum(f["count"] for f in sell_fills_detail if f["side"] == "no")
+
+        # Revenue from sells: on Kalshi, sells are reported at the fill price
+        # For "sell NO" when holding YES: auto-netting means revenue = (100 - no_price) per contract
+        # For "sell YES": revenue = yes_price per contract
+        # The simplest correct model: sell revenue = yes_price * count for ALL sells
+        # because yes_price reflects the YES-equivalent value in every fill
+        sell_revenue_cents = sum(f["count"] * f["yes_price"] for f in sell_fills_detail)
+
+        # Remaining position after sells (with auto-netting)
+        # Sell YES reduces YES. Sell NO auto-nets with YES (or creates short NO).
+        yes_remaining = yes_bought - yes_sold
+        # NO sold when holding YES = auto-netted with YES
+        auto_netted = min(no_sold, max(yes_remaining, 0))
+        yes_remaining -= auto_netted
+        # Any excess NO sold beyond netting = short NO
+        short_no = no_sold - auto_netted
+
+        # NO remaining from NO buys (less any YES sells that netted)
+        no_remaining = no_bought
+        if yes_sold > yes_bought:
+            # Sold more YES than bought = sold YES to net with NO
+            excess_yes_sold = yes_sold - yes_bought
+            yes_net_with_no = min(excess_yes_sold, no_remaining)
+            no_remaining -= yes_net_with_no
+
+        # Query Kalshi for market result
+        market_result = ""
+        try:
+            mkt_data = await bot._get(f"/markets/{ticker}")
+            market_data = mkt_data.get("market", mkt_data)
+            market_result = market_data.get("result", "")
+        except Exception:
+            pass
+
+        # Compute settlement value for remaining positions
+        settle_cents = 0
+        if market_result:
+            if market_result.lower() == "yes":
+                settle_cents += yes_remaining * 100  # YES pays 100c
+                settle_cents += no_remaining * 0     # NO pays 0
+                settle_cents -= short_no * 100       # Short NO costs 100c when YES wins
+                # Actually short NO at settlement: bot owes 0 (NO is worthless when YES wins)
+                settle_cents += short_no * 0  # short NO costs 0 when YES wins (NO=0, nothing owed)
+                # Correction: re-compute
+                settle_cents = yes_remaining * 100 + no_remaining * 0
+                # Short NO when YES wins: the NO is worthless, short expires worthless → no cost
+            elif market_result.lower() == "no":
+                settle_cents = yes_remaining * 0 + no_remaining * 100
+                # Short NO when NO wins: owe 100c per contract
+                settle_cents -= short_no * 100
+        else:
+            # Market still open - remaining position unsettled
+            settle_cents = 0
+
+        total_revenue_cents = sell_revenue_cents + settle_cents
+        pnl_cents = total_revenue_cents - total_cost_cents
+
+        # Effective entry (weighted average cost per contract on the primary side)
+        primary_side = "yes" if yes_bought >= no_bought else "no"
+        if primary_side == "yes" and yes_bought > 0:
+            avg_entry_cents = sum(f["count"] * f["yes_price"] for f in fills if f["action"] == "buy" and f["side"] == "yes") / yes_bought
+        elif no_bought > 0:
+            avg_entry_cents = sum(f["count"] * f["no_price"] for f in fills if f["action"] == "buy" and f["side"] == "no") / no_bought
+        else:
+            avg_entry_cents = 0
+
+        total_qty = yes_bought + no_bought
+        exit_qty = yes_sold + no_sold
+        settled_qty = yes_remaining + no_remaining
+
+        results.append({
+            "ticker": ticker,
+            "primary_side": primary_side,
+            "buys": {"yes": yes_bought, "no": no_bought, "total_cost_cents": total_cost_cents},
+            "sells": {"yes": yes_sold, "no": no_sold, "revenue_cents": sell_revenue_cents},
+            "remaining": {"yes": yes_remaining, "no": no_remaining, "short_no": short_no},
+            "result": market_result,
+            "settle_cents": settle_cents,
+            "pnl_cents": pnl_cents,
+            "avg_entry_cents": round(avg_entry_cents, 1),
+        })
+
+    # 4. Rebuild trades table for live mode
+    with get_db() as conn:
+        # Clear all live trades
+        conn.execute("DELETE FROM trades WHERE market_id NOT LIKE '[PAPER]%'")
+
+        for mkt in results:
+            ticker = mkt["ticker"]
+            side = mkt["primary_side"]
+
+            # Get fills for this market to record individual buys
+            mkt_fills = markets[ticker]
+            for f in sorted(mkt_fills, key=lambda x: x["created_time"]):
+                if f["action"] == "buy":
+                    fill_side = f["side"]
+                    fill_price = f["yes_price"] / 100.0 if fill_side == "yes" else f["no_price"] / 100.0
+                    conn.execute(
+                        "INSERT INTO trades (ts, market_id, side, action, price, quantity, order_id) "
+                        "VALUES (?, ?, ?, 'BUY', ?, ?, ?)",
+                        (f["created_time"], ticker, fill_side, fill_price, f["count"], f["order_id"]),
+                    )
+                elif f["action"] == "sell":
+                    fill_side = f["side"]
+                    # Revenue: use yes_price for YES sells, for NO sells use (100-no_price)/100 = yes_price/100
+                    fill_price = f["yes_price"] / 100.0
+                    conn.execute(
+                        "INSERT INTO trades (ts, market_id, side, action, price, quantity, order_id) "
+                        "VALUES (?, ?, ?, 'SELL', ?, ?, ?)",
+                        (f["created_time"], ticker, fill_side, fill_price, f["count"], f["order_id"]),
+                    )
+
+            # Add SETTLE entry for remaining position
+            if mkt["result"] and (mkt["remaining"]["yes"] > 0 or mkt["remaining"]["no"] > 0):
+                if mkt["remaining"]["yes"] > 0:
+                    settle_price = 1.0 if mkt["result"].lower() == "yes" else 0.0
+                    conn.execute(
+                        "INSERT INTO trades (ts, market_id, side, action, price, quantity, order_id) "
+                        "VALUES (?, ?, 'yes', 'SETTLE', ?, ?, ?)",
+                        (datetime.now(timezone.utc).isoformat(), ticker, settle_price,
+                         mkt["remaining"]["yes"], f"reconcile-settle-{ticker}"),
+                    )
+                if mkt["remaining"]["no"] > 0:
+                    settle_price = 1.0 if mkt["result"].lower() == "no" else 0.0
+                    conn.execute(
+                        "INSERT INTO trades (ts, market_id, side, action, price, quantity, order_id) "
+                        "VALUES (?, ?, 'no', 'SETTLE', ?, ?, ?)",
+                        (datetime.now(timezone.utc).isoformat(), ticker, settle_price,
+                         mkt["remaining"]["no"], f"reconcile-settle-{ticker}"),
+                    )
+
+    log_event("RECONCILE", f"Reconciled {len(results)} markets from Kalshi fills")
+
+    # Summary
+    total_pnl = sum(m["pnl_cents"] for m in results if m["result"]) / 100.0
+    settled_count = sum(1 for m in results if m["result"])
+    open_count = sum(1 for m in results if not m["result"])
+
+    return {
+        "ok": True,
+        "total_markets": len(results),
+        "settled": settled_count,
+        "open": open_count,
+        "total_pnl": round(total_pnl, 2),
+        "markets": results,
+    }
 
 
 # ------------------------------------------------------------------

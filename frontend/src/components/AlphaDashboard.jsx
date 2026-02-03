@@ -11,7 +11,7 @@ function SectionHeader({ title, badge }) {
 }
 
 // Inline-editable threshold: click to edit, Enter/blur to save
-function Editable({ configKey, display, type = 'int' }) {
+function Editable({ configKey, display, type = 'int', scale = 1 }) {
   const [editing, setEditing] = useState(false)
   const [val, setVal] = useState('')
   const [flash, setFlash] = useState(null) // 'ok' | 'err'
@@ -29,11 +29,13 @@ function Editable({ configKey, display, type = 'int' }) {
 
   const save = async () => {
     setEditing(false)
-    const parsed = type === 'float' ? parseFloat(val) : parseInt(val, 10)
+    let parsed = type === 'float' ? parseFloat(val) : parseInt(val, 10)
     if (isNaN(parsed)) return
+    if (scale !== 1) parsed = parsed / scale
     try {
       await postConfig({ [configKey]: parsed })
       setFlash('ok')
+      window.dispatchEvent(new Event('config-updated'))
     } catch {
       setFlash('err')
     }
@@ -173,6 +175,19 @@ export default function AlphaDashboard({ status }) {
 
   const dirArrow = (vel.direction_1m || 0) > 0 ? '\u2191' : (vel.direction_1m || 0) < 0 ? '\u2193' : '\u2194'
 
+  // --- Confidence ---
+  const confidence = status.confidence || 0
+  const confPct = Math.round(confidence * 100)
+  const minConf = db.min_confidence || 0.6
+  const minConfPct = Math.round(minConf * 100)
+  const confAbove = confidence >= minConf
+  const decision = status.decision || 'HOLD'
+  const decisionColors = {
+    BUY_YES: 'bg-green-500/15 text-green-400',
+    BUY_NO: 'bg-red-500/15 text-red-400',
+    HOLD: 'bg-white/[0.06] text-gray-500',
+  }
+
   const tf = db.time_factor || 0
   const tfPct = Math.round(tf * 100)
   const tfColor = tfPct > 50 ? 'bg-green-500' : tfPct > 20 ? 'bg-amber-500' : 'bg-red-500'
@@ -200,6 +215,9 @@ export default function AlphaDashboard({ status }) {
     { key: 'tp_reentry', label: 'TP Re-entry', g: guards.tp_reentry,
       fmt: () => guards.tp_reentry?.blocked ? 'BLOCKED' : 'OK',
       th: () => null },
+    { key: 'edge_reentry', label: 'Edge Re-entry', g: guards.edge_reentry,
+      fmt: g => g.blocked ? `${Math.round(g.cooldown_left)}s cooldown` : 'OK',
+      th: g => <span className="text-[10px] font-mono text-gray-600 flex-shrink-0">+{g.premium}c premium</span> },
   ]
   const blockedCount = guardEntries.filter(e => e.g?.blocked).length
   const passingCount = guardEntries.length - blockedCount
@@ -214,13 +232,23 @@ export default function AlphaDashboard({ status }) {
   const hasPosition = guards.same_side?.holding !== 'NONE'
   const exitEntries = [
     { key: 'stop_loss', label: 'Stop-Loss', e: exits.stop_loss, fmt: e => `${e.value}c loss`,
-      th: e => <Editable configKey="STOP_LOSS_CENTS" display={`${e.threshold}c`} /> },
+      th: e => <span className="text-[10px] text-gray-400 font-mono">{e.threshold}c</span> },
     { key: 'hit_and_run', label: 'Hit & Run', e: exits.hit_and_run, fmt: e => `${e.value}% gain`,
       th: e => <Editable configKey="HIT_RUN_PCT" display={e.enabled ? `${e.threshold}%` : 'OFF'} type="float" /> },
     { key: 'profit_take', label: 'Profit Take', e: exits.profit_take, fmt: e => `${e.value}% gain`,
       th: e => <Editable configKey="PROFIT_TAKE_PCT" display={`${e.threshold}%`} /> },
     { key: 'free_roll', label: 'Free Roll', e: exits.free_roll, fmt: e => `${e.value}c (${e.qty}x)`,
       th: e => <Editable configKey="FREE_ROLL_PRICE" display={`${e.threshold}c`} /> },
+    { key: 'edge_exit', label: 'Edge Exit', e: exits.edge_exit,
+      fmt: e => `${e.remaining_edge}c edge / ${e.threshold}c thr`,
+      th: e => <Editable configKey="EDGE_EXIT_THRESHOLD_CENTS" display={`${db.edge_exit_threshold || 2}c`} />,
+      badge: e => (
+        <span className="flex items-center gap-1">
+          {e.count > 0 && <span className="text-[9px] font-bold px-1 py-0.5 rounded bg-amber-500/15 text-amber-400">{e.count}x</span>}
+          <Toggle configKey="EDGE_EXIT_ENABLED" enabled={e.enabled} />
+        </span>
+      ),
+    },
   ]
 
   const overrideBadge = override
@@ -257,7 +285,22 @@ export default function AlphaDashboard({ status }) {
       />
 
       {/* Section 2: Strategy */}
-      <SectionHeader title="Strategy" />
+      <SectionHeader title="Strategy" badge={<span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${decisionColors[decision] || decisionColors.HOLD}`}>{decision.replace('_', ' ')}</span>} />
+      {/* Confidence with progress bar */}
+      <div className="flex items-center gap-2 py-0.5">
+        <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${confAbove ? 'bg-green-500' : 'bg-red-500'}`} />
+        <span className="text-[10px] text-gray-500 w-20 flex-shrink-0">Confidence</span>
+        <div className="flex-1 h-1.5 bg-white/[0.04] rounded-full overflow-hidden relative">
+          {/* Threshold marker */}
+          <div className="absolute top-0 bottom-0 w-px bg-gray-500/50 z-10" style={{ left: `${minConfPct}%` }} />
+          <div
+            className={`h-full rounded-full transition-all duration-700 ${confAbove ? 'bg-green-500' : confPct > minConfPct * 0.7 ? 'bg-amber-500' : 'bg-red-500'}`}
+            style={{ width: `${confPct}%` }}
+          />
+        </div>
+        <span className={`text-[11px] font-mono font-semibold flex-shrink-0 ${confAbove ? 'text-green-400' : 'text-gray-500'}`}>{confPct}%</span>
+        <Editable configKey="RULE_MIN_CONFIDENCE" display={`≥${minConfPct}%`} type="float" scale={100} />
+      </div>
       <Row
         dot={fairCents != null && midpoint != null && Math.abs(fairCents - midpoint) >= minEdge ? 'green' : 'gray'}
         label="Fair Value"
@@ -306,13 +349,14 @@ export default function AlphaDashboard({ status }) {
 
       {/* Section 4: Exit Rules */}
       <SectionHeader title="Exit Rules" badge={posBadge} />
-      {exitEntries.map(({ key, label, e, fmt, th }) => e && (
+      {exitEntries.map(({ key, label, e, fmt, th, badge }) => e && (
         <Row
           key={key}
           dot={e.triggered ? 'red' : 'gray'}
           label={label}
           value={hasPosition ? fmt(e) : '--'}
           threshold={th(e)}
+          badge={badge ? badge(e) : null}
         />
       ))}
     </div>

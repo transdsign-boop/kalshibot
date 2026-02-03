@@ -42,6 +42,11 @@ const SETTINGS = {
     unit: '%',
     desc: 'Halt all trading if total realized losses exceed this percentage of your starting balance.',
   },
+  STOP_LOSS_CENTS: {
+    label: 'Stop Loss',
+    unit: 'c',
+    desc: 'Exit position if down this many cents per contract. Higher = more room before cutting losses.',
+  },
   PROFIT_TAKE_MIN_SECS: {
     label: 'PT Min Time Left',
     unit: 's',
@@ -81,6 +86,10 @@ const SETTINGS = {
     unit: '$/s',
     desc: 'Minimum BTC price movement speed for trend-following bonus in high-vol mode. Lower = easier to trigger.',
   },
+  EDGE_EXIT_ENABLED: {
+    label: 'Edge Exit',
+    desc: 'Exit positions when remaining edge evaporates. Allows re-entry after cooldown with higher edge requirement.',
+  },
 }
 
 const GROUPS = [
@@ -90,11 +99,11 @@ const GROUPS = [
   },
   {
     title: 'Sizing & Risk',
-    keys: ['ORDER_SIZE_PCT', 'MAX_POSITION_PCT', 'MAX_TOTAL_EXPOSURE_PCT', 'MAX_DAILY_LOSS_PCT'],
+    keys: ['ORDER_SIZE_PCT', 'MAX_POSITION_PCT', 'MAX_TOTAL_EXPOSURE_PCT', 'MAX_DAILY_LOSS_PCT', 'STOP_LOSS_CENTS'],
   },
   {
     title: 'Strategy',
-    keys: ['EXTREME_DELTA_THRESHOLD', 'PROFIT_TAKE_MIN_SECS', 'RULE_MIN_CONFIDENCE', 'FAIR_VALUE_K', 'VOL_HIGH_THRESHOLD', 'VOL_LOW_THRESHOLD', 'RULE_SIT_OUT_LOW_VOL', 'TREND_FOLLOW_VELOCITY'],
+    keys: ['EDGE_EXIT_ENABLED', 'EXTREME_DELTA_THRESHOLD', 'PROFIT_TAKE_MIN_SECS', 'RULE_MIN_CONFIDENCE', 'FAIR_VALUE_K', 'VOL_HIGH_THRESHOLD', 'VOL_LOW_THRESHOLD', 'RULE_SIT_OUT_LOW_VOL', 'TREND_FOLLOW_VELOCITY'],
   },
 ]
 
@@ -103,8 +112,14 @@ export default function ConfigPanel() {
   const [statusMsg, setStatusMsg] = useState({ text: '', ok: true })
   const [saving, setSaving] = useState(false)
 
+  const refresh = () => fetchConfig().then(setCfgMeta).catch(console.error)
+
   useEffect(() => {
-    fetchConfig().then(setCfgMeta).catch(console.error)
+    refresh()
+    // Re-fetch when config is changed elsewhere (e.g. analytics suggestion applied)
+    const handler = () => refresh()
+    window.addEventListener('config-updated', handler)
+    return () => window.removeEventListener('config-updated', handler)
   }, [])
 
   function showStatus(text, ok) {
