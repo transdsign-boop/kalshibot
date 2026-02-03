@@ -1,6 +1,28 @@
 import { useState, useRef, useEffect } from 'react'
 import { postConfig } from '../api'
 
+function CollapsibleSection({ title, badge, summary, children, defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div className="pt-2 border-t border-white/[0.04] first:border-t-0 first:pt-0">
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-full flex items-center justify-between pb-1 cursor-pointer hover:bg-white/[0.02] -mx-1 px-1 rounded transition"
+      >
+        <div className="flex items-center gap-2">
+          <span className="text-gray-600 text-[9px] w-3">{open ? '▼' : '▶'}</span>
+          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">{title}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          {!open && summary}
+          {badge}
+        </div>
+      </button>
+      {open && <div className="mt-1">{children}</div>}
+    </div>
+  )
+}
+
 function SectionHeader({ title, badge }) {
   return (
     <div className="flex items-center justify-between pt-2 pb-1 border-t border-white/[0.04] first:border-t-0 first:pt-0">
@@ -116,6 +138,28 @@ function Row({ dot, label, value, threshold, badge }) {
       <span className="text-[11px] font-mono text-gray-300 flex-1 truncate">{value}</span>
       {threshold}
       {badge}
+    </div>
+  )
+}
+
+// Compact meter for collapsed summaries
+function MiniMeter({ value, max = 100, color = 'blue', label }) {
+  const pct = Math.min(100, Math.max(0, (value / max) * 100))
+  const colors = {
+    green: 'bg-green-500',
+    red: 'bg-red-500',
+    amber: 'bg-amber-500',
+    blue: 'bg-blue-500',
+    purple: 'bg-purple-500',
+    gray: 'bg-gray-500',
+  }
+  return (
+    <div className="flex items-center gap-1.5">
+      {label && <span className="text-[9px] text-gray-500">{label}</span>}
+      <div className="w-12 h-1.5 bg-white/[0.06] rounded-full overflow-hidden">
+        <div className={`h-full rounded-full ${colors[color] || colors.blue}`} style={{ width: `${pct}%` }} />
+      </div>
+      <span className="text-[9px] font-mono text-gray-400">{Math.round(value)}%</span>
     </div>
   )
 }
@@ -259,106 +303,145 @@ export default function AlphaDashboard({ status }) {
     ? <span className="text-[9px] font-bold px-1 py-0.5 rounded bg-blue-500/15 text-blue-400">{guards.same_side?.holding}</span>
     : <span className="text-[9px] text-gray-600">no position</span>
 
+  // Summary meter for Alpha Signals
+  const alphaStrength = signal !== 'NEUTRAL' ? 80 : absMom >= db.delta_threshold ? 60 : absMom >= db.delta_threshold * 0.6 ? 40 : 20
+  const alphaColor = signal !== 'NEUTRAL' ? 'green' : absMom >= db.extreme_delta_threshold ? 'red' : absMom >= db.delta_threshold ? 'amber' : 'gray'
+  const alphaSummary = (
+    <MiniMeter value={alphaStrength} color={alphaColor} label="Signal" />
+  )
+
+  // Summary for Strategy (confidence meter always visible)
+  const confColor = confAbove ? 'green' : confPct > minConfPct * 0.7 ? 'amber' : 'red'
+  const strategySummary = (
+    <MiniMeter value={confPct} color={confColor} label="Conf" />
+  )
+
+  // Summary for Guards
+  const guardsSummary = (
+    <span className="text-[9px] font-mono text-gray-400">{passingCount}/{guardEntries.length}</span>
+  )
+
   return (
     <div className="card px-4 py-3 mb-4">
-      {/* Section 1: Alpha Signals */}
-      <SectionHeader title="Alpha Signals" badge={overrideBadge} />
-      <Row
-        dot={leadLagDot}
-        label="Lead-Lag"
-        value={`${signal} ${signalDiff !== 0 ? (signalDiff > 0 ? '+' : '') + signalDiff.toFixed(0) : ''}`}
-        threshold={<Editable configKey="LEAD_LAG_THRESHOLD" display={`\u00b1$${db.lead_lag_threshold || 75}`} />}
-        badge={<Toggle configKey="LEAD_LAG_ENABLED" enabled={db.lead_lag_enabled} />}
-      />
-      <Row
-        dot={momDot}
-        label="Momentum"
-        value={`${momentum >= 0 ? '+' : ''}${momentum.toFixed(1)}`}
-        threshold={<Editable configKey="DELTA_THRESHOLD" display={`\u00b1$${db.delta_threshold}`} />}
-        badge={momBadge}
-      />
-      <Row
-        dot={anchorDot}
-        label="Anchor"
-        value={anchorActive ? `${Math.round(secsLeft)}s / ${guards.same_side?.holding}` : `${Math.round(secsLeft)}s`}
-        threshold={<Editable configKey="ANCHOR_SECONDS_THRESHOLD" display={`<${db.anchor_seconds_threshold}s`} />}
-      />
-
-      {/* Section 2: Strategy */}
-      <SectionHeader title="Strategy" badge={<span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${decisionColors[decision] || decisionColors.HOLD}`}>{decision.replace('_', ' ')}</span>} />
-      {/* Confidence with progress bar */}
-      <div className="flex items-center gap-2 py-0.5">
-        <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${confAbove ? 'bg-green-500' : 'bg-red-500'}`} />
-        <span className="text-[10px] text-gray-500 w-20 flex-shrink-0">Confidence</span>
-        <div className="flex-1 h-1.5 bg-white/[0.04] rounded-full overflow-hidden relative">
-          {/* Threshold marker */}
+      {/* Always-visible confidence meter at top */}
+      <div className="flex items-center gap-2 pb-2 mb-1 border-b border-white/[0.04]">
+        <span className="text-[10px] text-gray-500 shrink-0">Confidence</span>
+        <div className="flex-1 h-2 bg-white/[0.04] rounded-full overflow-hidden relative">
           <div className="absolute top-0 bottom-0 w-px bg-gray-500/50 z-10" style={{ left: `${minConfPct}%` }} />
           <div
-            className={`h-full rounded-full transition-all duration-700 ${confAbove ? 'bg-green-500' : confPct > minConfPct * 0.7 ? 'bg-amber-500' : 'bg-red-500'}`}
+            className={`h-full rounded-full transition-all duration-500 ${confAbove ? 'bg-green-500' : confPct > minConfPct * 0.7 ? 'bg-amber-500' : 'bg-red-500'}`}
             style={{ width: `${confPct}%` }}
           />
         </div>
-        <span className={`text-[11px] font-mono font-semibold flex-shrink-0 ${confAbove ? 'text-green-400' : 'text-gray-500'}`}>{confPct}%</span>
-        <Editable configKey="RULE_MIN_CONFIDENCE" display={`≥${minConfPct}%`} type="float" scale={100} />
+        <span className={`text-sm font-mono font-bold shrink-0 ${confAbove ? 'text-green-400' : 'text-gray-500'}`}>{confPct}%</span>
+        <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded shrink-0 ${decisionColors[decision] || decisionColors.HOLD}`}>{decision.replace('_', ' ')}</span>
       </div>
-      <Row
-        dot={fairCents != null && midpoint != null && Math.abs(fairCents - midpoint) >= minEdge ? 'green' : 'gray'}
-        label="Fair Value"
-        value={fairCents != null ? `${fairCents}c YES (${Math.round((fv.fair_yes_prob || 0) * 100)}%)` : '--'}
-        threshold={midpoint != null ? <span className="text-[10px] font-mono text-gray-600 flex-shrink-0">mid {midpoint}c</span> : null}
-      />
-      <Row
-        dot={hasEdge ? 'green' : 'gray'}
-        label="Edge"
-        value={`Y:${yesEdge >= 0 ? '+' : ''}${yesEdge}c  N:${noEdge >= 0 ? '+' : ''}${noEdge}c`}
-        threshold={<Editable configKey="MIN_EDGE_CENTS" display={`\u2265${minEdge}c`} />}
-      />
-      <Row
-        dot={vol.regime === 'high' ? 'purple' : vol.regime === 'low' ? 'gray' : 'amber'}
-        label="Volatility"
-        value={`$${(vol.vol_dollar_per_min || 0).toFixed(1)}/min`}
-        threshold={null}
-        badge={regimeBadge}
-      />
-      <Row
-        dot={(vel.direction_1m || 0) !== 0 ? 'green' : 'gray'}
-        label="Velocity"
-        value={`${dirArrow} $${(vel.price_change_1m || 0) >= 0 ? '+' : ''}${(vel.price_change_1m || 0).toFixed(0)}/1m`}
-      />
-      {/* Time factor with progress bar */}
-      <div className="flex items-center gap-2 py-0.5">
-        <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${tfPct > 50 ? 'bg-green-500' : tfPct > 20 ? 'bg-amber-500' : 'bg-red-500'}`} />
-        <span className="text-[10px] text-gray-500 w-20 flex-shrink-0">Time Factor</span>
-        <div className="flex-1 h-1 bg-white/[0.04] rounded-full overflow-hidden">
-          <div className={`h-full rounded-full transition-all duration-700 ${tfColor}`} style={{ width: `${tfPct}%` }} />
+
+      {/* Section 1: Alpha Signals */}
+      <CollapsibleSection title="Alpha Signals" badge={overrideBadge} summary={alphaSummary}>
+        <Row
+          dot={leadLagDot}
+          label="Lead-Lag"
+          value={`${signal} ${signalDiff !== 0 ? (signalDiff > 0 ? '+' : '') + signalDiff.toFixed(0) : ''}`}
+          threshold={<Editable configKey="LEAD_LAG_THRESHOLD" display={`\u00b1$${db.lead_lag_threshold || 75}`} />}
+          badge={<Toggle configKey="LEAD_LAG_ENABLED" enabled={db.lead_lag_enabled} />}
+        />
+        <Row
+          dot={momDot}
+          label="Momentum"
+          value={`${momentum >= 0 ? '+' : ''}${momentum.toFixed(1)}`}
+          threshold={<Editable configKey="DELTA_THRESHOLD" display={`\u00b1$${db.delta_threshold}`} />}
+          badge={momBadge}
+        />
+        <Row
+          dot={anchorDot}
+          label="Anchor"
+          value={anchorActive ? `${Math.round(secsLeft)}s / ${guards.same_side?.holding}` : `${Math.round(secsLeft)}s`}
+          threshold={<Editable configKey="ANCHOR_SECONDS_THRESHOLD" display={`<${db.anchor_seconds_threshold}s`} />}
+        />
+      </CollapsibleSection>
+
+      {/* Section 2: Strategy */}
+      <CollapsibleSection
+        title="Strategy"
+        badge={<span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${decisionColors[decision] || decisionColors.HOLD}`}>{decision.replace('_', ' ')}</span>}
+        summary={strategySummary}
+      >
+        {/* Detailed confidence with progress bar */}
+        <div className="flex items-center gap-2 py-0.5">
+          <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${confAbove ? 'bg-green-500' : 'bg-red-500'}`} />
+          <span className="text-[10px] text-gray-500 w-20 flex-shrink-0">Confidence</span>
+          <div className="flex-1 h-1.5 bg-white/[0.04] rounded-full overflow-hidden relative">
+            <div className="absolute top-0 bottom-0 w-px bg-gray-500/50 z-10" style={{ left: `${minConfPct}%` }} />
+            <div
+              className={`h-full rounded-full transition-all duration-700 ${confAbove ? 'bg-green-500' : confPct > minConfPct * 0.7 ? 'bg-amber-500' : 'bg-red-500'}`}
+              style={{ width: `${confPct}%` }}
+            />
+          </div>
+          <span className={`text-[11px] font-mono font-semibold flex-shrink-0 ${confAbove ? 'text-green-400' : 'text-gray-500'}`}>{confPct}%</span>
+          <Editable configKey="RULE_MIN_CONFIDENCE" display={`≥${minConfPct}%`} type="float" scale={100} />
         </div>
-        <span className="text-[10px] font-mono text-gray-600 flex-shrink-0">{tfPct}%</span>
-      </div>
+        <Row
+          dot={fairCents != null && midpoint != null && Math.abs(fairCents - midpoint) >= minEdge ? 'green' : 'gray'}
+          label="Fair Value"
+          value={fairCents != null ? `${fairCents}c YES (${Math.round((fv.fair_yes_prob || 0) * 100)}%)` : '--'}
+          threshold={midpoint != null ? <span className="text-[10px] font-mono text-gray-600 flex-shrink-0">mid {midpoint}c</span> : null}
+        />
+        <Row
+          dot={hasEdge ? 'green' : 'gray'}
+          label="Edge"
+          value={`Y:${yesEdge >= 0 ? '+' : ''}${yesEdge}c  N:${noEdge >= 0 ? '+' : ''}${noEdge}c`}
+          threshold={<Editable configKey="MIN_EDGE_CENTS" display={`\u2265${minEdge}c`} />}
+        />
+        <Row
+          dot={vol.regime === 'high' ? 'purple' : vol.regime === 'low' ? 'gray' : 'amber'}
+          label="Volatility"
+          value={`$${(vol.vol_dollar_per_min || 0).toFixed(1)}/min`}
+          threshold={null}
+          badge={regimeBadge}
+        />
+        <Row
+          dot={(vel.direction_1m || 0) !== 0 ? 'green' : 'gray'}
+          label="Velocity"
+          value={`${dirArrow} $${(vel.price_change_1m || 0) >= 0 ? '+' : ''}${(vel.price_change_1m || 0).toFixed(0)}/1m`}
+        />
+        {/* Time factor with progress bar */}
+        <div className="flex items-center gap-2 py-0.5">
+          <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${tfPct > 50 ? 'bg-green-500' : tfPct > 20 ? 'bg-amber-500' : 'bg-red-500'}`} />
+          <span className="text-[10px] text-gray-500 w-20 flex-shrink-0">Time Factor</span>
+          <div className="flex-1 h-1 bg-white/[0.04] rounded-full overflow-hidden">
+            <div className={`h-full rounded-full transition-all duration-700 ${tfColor}`} style={{ width: `${tfPct}%` }} />
+          </div>
+          <span className="text-[10px] font-mono text-gray-600 flex-shrink-0">{tfPct}%</span>
+        </div>
+      </CollapsibleSection>
 
       {/* Section 3: Guards */}
-      <SectionHeader title="Guards" badge={guardBadge} />
-      {guardEntries.map(({ key, label, g, fmt, th }) => g && (
-        <Row
-          key={key}
-          dot={g.blocked ? 'red' : 'green'}
-          label={label}
-          value={fmt(g)}
-          threshold={th(g)}
-        />
-      ))}
+      <CollapsibleSection title="Guards" badge={guardBadge} summary={guardsSummary}>
+        {guardEntries.map(({ key, label, g, fmt, th }) => g && (
+          <Row
+            key={key}
+            dot={g.blocked ? 'red' : 'green'}
+            label={label}
+            value={fmt(g)}
+            threshold={th(g)}
+          />
+        ))}
+      </CollapsibleSection>
 
       {/* Section 4: Exit Rules */}
-      <SectionHeader title="Exit Rules" badge={posBadge} />
-      {exitEntries.map(({ key, label, e, fmt, th, badge }) => e && (
-        <Row
-          key={key}
-          dot={e.triggered ? 'red' : 'gray'}
-          label={label}
-          value={hasPosition ? fmt(e) : '--'}
-          threshold={th(e)}
-          badge={badge ? badge(e) : null}
-        />
-      ))}
+      <CollapsibleSection title="Exit Rules" badge={posBadge}>
+        {exitEntries.map(({ key, label, e, fmt, th, badge }) => e && (
+          <Row
+            key={key}
+            dot={e.triggered ? 'red' : 'gray'}
+            label={label}
+            value={hasPosition ? fmt(e) : '--'}
+            threshold={th(e)}
+            badge={badge ? badge(e) : null}
+          />
+        ))}
+      </CollapsibleSection>
     </div>
   )
 }

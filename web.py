@@ -15,7 +15,7 @@ import config
 _ob_cache: dict = {"ticker": "", "data": None, "ts": 0.0}
 _OB_CACHE_TTL = 2.0  # seconds
 from config import get_tunables, set_tunables, restore_tunables, TUNABLE_FIELDS
-from database import init_db, get_recent_logs, get_latest_decision, get_todays_trades, get_trades_with_pnl, get_setting, set_setting, get_all_unsettled_live_entries, backfill_buy_trades_from_snapshots, get_db
+from database import init_db, get_recent_logs, get_latest_decision, get_todays_trades, get_trades_with_pnl, get_setting, set_setting, get_all_unsettled_live_entries, backfill_buy_trades_from_snapshots, get_db, set_live_market_pnl
 from alpha_engine import AlphaMonitor
 from trader import TradingBot
 
@@ -290,7 +290,7 @@ async def kalshi_fills(since: str = ""):
 
 
 @app.post("/api/reconcile")
-async def reconcile_trades(since_utc: str = "2026-02-02T20:00:00Z"):
+async def reconcile_trades(since_utc: str = "2026-01-01T00:00:00Z"):
     """Reconcile trade log with actual Kalshi fills.
 
     Fetches all fills from Kalshi, queries market results for expired markets,
@@ -304,7 +304,7 @@ async def reconcile_trades(since_utc: str = "2026-02-02T20:00:00Z"):
     # 1. Fetch all Kalshi fills (paginated)
     all_fills = []
     cursor = None
-    for _ in range(10):  # max 10 pages
+    for _ in range(50):  # max 50 pages (5000 fills)
         params = {"limit": 100}
         if cursor:
             params["cursor"] = cursor
@@ -339,55 +339,41 @@ async def reconcile_trades(since_utc: str = "2026-02-02T20:00:00Z"):
             markets[t] = []
         markets[t].append(f)
 
-    # 3. For each market: compute position, cost, and query result
+    # 3. For each market: compute position, cost, fees, and query result
     results = []
     for ticker, fills in sorted(markets.items()):
         fills.sort(key=lambda x: x["created_time"])
 
-        # Track position and cash flows
-        yes_bought = 0
-        no_bought = 0
-        total_cost_cents = 0  # cash out
-        sell_fills_detail = []
+        # Simple P&L model: track cash in (sells + settlement) vs cash out (buys)
+        # Kalshi handles auto-netting internally, so we just track net position
+        total_cost_cents = 0  # money spent on buys
+        total_sell_revenue_cents = 0  # money received from sells
+        total_fees_cents = 0  # fees paid
+        yes_position = 0  # net YES contracts held
+        no_position = 0   # net NO contracts held
 
         for f in fills:
+            count = f["count"]
+            # Track fees (fee_cost is a string like "0.0000")
+            fee_str = f.get("fee_cost", "0")
+            fee_dollars = float(fee_str) if fee_str else 0
+            total_fees_cents += fee_dollars * 100
+
             if f["action"] == "buy":
                 if f["side"] == "yes":
-                    yes_bought += f["count"]
-                    total_cost_cents += f["count"] * f["yes_price"]
+                    total_cost_cents += count * f["yes_price"]
+                    yes_position += count
                 else:
-                    no_bought += f["count"]
-                    total_cost_cents += f["count"] * f["no_price"]
+                    total_cost_cents += count * f["no_price"]
+                    no_position += count
             elif f["action"] == "sell":
-                sell_fills_detail.append(f)
-
-        # Process sells: track what was sold on each side
-        yes_sold = sum(f["count"] for f in sell_fills_detail if f["side"] == "yes")
-        no_sold = sum(f["count"] for f in sell_fills_detail if f["side"] == "no")
-
-        # Revenue from sells: on Kalshi, sells are reported at the fill price
-        # For "sell NO" when holding YES: auto-netting means revenue = (100 - no_price) per contract
-        # For "sell YES": revenue = yes_price per contract
-        # The simplest correct model: sell revenue = yes_price * count for ALL sells
-        # because yes_price reflects the YES-equivalent value in every fill
-        sell_revenue_cents = sum(f["count"] * f["yes_price"] for f in sell_fills_detail)
-
-        # Remaining position after sells (with auto-netting)
-        # Sell YES reduces YES. Sell NO auto-nets with YES (or creates short NO).
-        yes_remaining = yes_bought - yes_sold
-        # NO sold when holding YES = auto-netted with YES
-        auto_netted = min(no_sold, max(yes_remaining, 0))
-        yes_remaining -= auto_netted
-        # Any excess NO sold beyond netting = short NO
-        short_no = no_sold - auto_netted
-
-        # NO remaining from NO buys (less any YES sells that netted)
-        no_remaining = no_bought
-        if yes_sold > yes_bought:
-            # Sold more YES than bought = sold YES to net with NO
-            excess_yes_sold = yes_sold - yes_bought
-            yes_net_with_no = min(excess_yes_sold, no_remaining)
-            no_remaining -= yes_net_with_no
+                # Sell revenue: for YES sells, get yes_price; for NO sells, get no_price
+                if f["side"] == "yes":
+                    total_sell_revenue_cents += count * f["yes_price"]
+                    yes_position -= count
+                else:
+                    total_sell_revenue_cents += count * f["no_price"]
+                    no_position -= count
 
         # Query Kalshi for market result
         market_result = ""
@@ -398,31 +384,26 @@ async def reconcile_trades(since_utc: str = "2026-02-02T20:00:00Z"):
         except Exception:
             pass
 
-        # Compute settlement value for remaining positions
+        # Settlement payout for remaining position
         settle_cents = 0
         if market_result:
-            if market_result.lower() == "yes":
-                settle_cents += yes_remaining * 100  # YES pays 100c
-                settle_cents += no_remaining * 0     # NO pays 0
-                settle_cents -= short_no * 100       # Short NO costs 100c when YES wins
-                # Actually short NO at settlement: bot owes 0 (NO is worthless when YES wins)
-                settle_cents += short_no * 0  # short NO costs 0 when YES wins (NO=0, nothing owed)
-                # Correction: re-compute
-                settle_cents = yes_remaining * 100 + no_remaining * 0
-                # Short NO when YES wins: the NO is worthless, short expires worthless → no cost
-            elif market_result.lower() == "no":
-                settle_cents = yes_remaining * 0 + no_remaining * 100
-                # Short NO when NO wins: owe 100c per contract
-                settle_cents -= short_no * 100
-        else:
-            # Market still open - remaining position unsettled
-            settle_cents = 0
+            yes_wins = market_result.lower() == "yes"
+            # YES position pays 100c if YES wins, 0 if NO wins
+            if yes_position > 0:
+                settle_cents += yes_position * (100 if yes_wins else 0)
+            # NO position pays 100c if NO wins, 0 if YES wins
+            if no_position > 0:
+                settle_cents += no_position * (100 if not yes_wins else 0)
 
-        total_revenue_cents = sell_revenue_cents + settle_cents
+        total_revenue_cents = total_sell_revenue_cents + settle_cents
+        # P&L excludes fees (fees tracked separately)
         pnl_cents = total_revenue_cents - total_cost_cents
 
-        # Effective entry (weighted average cost per contract on the primary side)
+        # Determine primary side and average entry
+        yes_bought = sum(f["count"] for f in fills if f["action"] == "buy" and f["side"] == "yes")
+        no_bought = sum(f["count"] for f in fills if f["action"] == "buy" and f["side"] == "no")
         primary_side = "yes" if yes_bought >= no_bought else "no"
+
         if primary_side == "yes" and yes_bought > 0:
             avg_entry_cents = sum(f["count"] * f["yes_price"] for f in fills if f["action"] == "buy" and f["side"] == "yes") / yes_bought
         elif no_bought > 0:
@@ -430,18 +411,18 @@ async def reconcile_trades(since_utc: str = "2026-02-02T20:00:00Z"):
         else:
             avg_entry_cents = 0
 
-        total_qty = yes_bought + no_bought
-        exit_qty = yes_sold + no_sold
-        settled_qty = yes_remaining + no_remaining
-
         results.append({
             "ticker": ticker,
             "primary_side": primary_side,
             "buys": {"yes": yes_bought, "no": no_bought, "total_cost_cents": total_cost_cents},
-            "sells": {"yes": yes_sold, "no": no_sold, "revenue_cents": sell_revenue_cents},
-            "remaining": {"yes": yes_remaining, "no": no_remaining, "short_no": short_no},
+            "sells": {"yes": sum(f["count"] for f in fills if f["action"] == "sell" and f["side"] == "yes"),
+                      "no": sum(f["count"] for f in fills if f["action"] == "sell" and f["side"] == "no"),
+                      "revenue_cents": total_sell_revenue_cents},
+            "remaining": {"yes": max(0, yes_position), "no": max(0, no_position)},
             "result": market_result,
             "settle_cents": settle_cents,
+            "total_revenue_cents": total_revenue_cents,
+            "fees_cents": total_fees_cents,
             "pnl_cents": pnl_cents,
             "avg_entry_cents": round(avg_entry_cents, 1),
         })
@@ -494,6 +475,17 @@ async def reconcile_trades(since_utc: str = "2026-02-02T20:00:00Z"):
                         (datetime.now(timezone.utc).isoformat(), ticker, settle_price,
                          mkt["remaining"]["no"], f"reconcile-settle-{ticker}"),
                     )
+
+    # 5. Store actual Kalshi P&L and breakdown for each market
+    for mkt in results:
+        set_live_market_pnl(
+            mkt["ticker"],
+            mkt["pnl_cents"],
+            mkt["result"],
+            total_cost_cents=mkt["buys"]["total_cost_cents"],
+            total_revenue_cents=mkt["total_revenue_cents"],
+            fees_cents=mkt["fees_cents"],
+        )
 
     log_event("RECONCILE", f"Reconciled {len(results)} markets from Kalshi fills")
 
