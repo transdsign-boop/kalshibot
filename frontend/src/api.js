@@ -10,8 +10,9 @@ export async function fetchLogs() {
   return res.json();
 }
 
-export async function fetchTrades() {
-  const res = await fetch(`${BASE}/api/trades`);
+export async function fetchTrades(mode = '') {
+  const url = mode ? `${BASE}/api/trades?mode=${mode}` : `${BASE}/api/trades`;
+  const res = await fetch(url);
   return res.json();
 }
 
@@ -54,5 +55,20 @@ export async function postConfig(updates) {
 
 export async function postPaperReset() {
   const res = await fetch(`${BASE}/api/paper/reset`, { method: 'POST' });
+  return res.json();
+}
+
+export async function fetchAnalytics(mode = '') {
+  const url = mode ? `${BASE}/api/analytics?mode=${mode}` : `${BASE}/api/analytics`;
+  const res = await fetch(url);
+  return res.json();
+}
+
+export async function applySuggestion(param, value) {
+  const res = await fetch(`${BASE}/api/analytics/apply`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ param, value }),
+  });
   return res.json();
 }

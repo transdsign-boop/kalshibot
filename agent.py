@@ -97,24 +97,24 @@ class MarketAgent:
         if regime == "high":
             min_edge = max(3, min_edge - 3)
 
-        # Score YES
+        # Score YES — edge/100 spreads confidence over a wider range
         yes_score = 0.0
         if yes_edge >= min_edge:
-            yes_score = yes_edge / 50.0
+            yes_score = yes_edge / 100.0
             if trend_confirms_yes:
-                yes_score += 0.15
+                yes_score += 0.10
                 if regime == "high" and abs(vel_1m) > config.TREND_FOLLOW_VELOCITY:
-                    yes_score += 0.10
+                    yes_score += 0.05
             yes_score *= time_factor
 
         # Score NO
         no_score = 0.0
         if no_edge >= min_edge:
-            no_score = no_edge / 50.0
+            no_score = no_edge / 100.0
             if trend_confirms_no:
-                no_score += 0.15
+                no_score += 0.10
                 if regime == "high" and abs(vel_1m) > config.TREND_FOLLOW_VELOCITY:
-                    no_score += 0.10
+                    no_score += 0.05
             no_score *= time_factor
 
         # Pick the best side
@@ -123,12 +123,12 @@ class MarketAgent:
 
         if yes_score > no_score and yes_score > 0:
             decision = "BUY_YES"
-            confidence = min(0.99, 0.5 + yes_score)
+            confidence = min(0.95, 0.45 + yes_score)
             reasons.append(f"-> BUY YES (score {yes_score:.2f}, edge {yes_edge}c"
                            + (", trend OK" if trend_confirms_yes else "") + ")")
         elif no_score > yes_score and no_score > 0:
             decision = "BUY_NO"
-            confidence = min(0.99, 0.5 + no_score)
+            confidence = min(0.95, 0.45 + no_score)
             reasons.append(f"-> BUY NO (score {no_score:.2f}, edge {no_edge}c"
                            + (", trend OK" if trend_confirms_no else "") + ")")
         else:
