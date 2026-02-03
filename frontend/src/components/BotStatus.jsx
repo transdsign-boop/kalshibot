@@ -1,9 +1,14 @@
-export default function BotStatus({ status }) {
+export default function BotStatus({ status, tradeData }) {
   const {
     running, last_action, decision, confidence, reasoning, alpha_override,
     balance, day_pnl, position_pnl, active_position, orderbook,
     total_account_value, start_balance
   } = status
+
+  // Trade log totals from actual Kalshi data
+  const tradeSummary = tradeData?.summary || {}
+  const totalTradePnl = tradeSummary.net_pnl || 0
+  const totalTrades = tradeSummary.total_trades || 0
   const conf = Math.round((confidence || 0) * 100)
   const action = last_action || 'Idle'
   const pnl = typeof day_pnl === 'number' ? day_pnl : parseFloat(day_pnl) || 0
@@ -71,24 +76,23 @@ export default function BotStatus({ status }) {
         <p className="text-[10px] text-purple-400 mb-2">Alpha: {alpha_override}</p>
       )}
 
-      {/* Confidence bar (thin) */}
-      {conf > 0 && (
-        <div className="flex items-center gap-2 mb-3">
-          <div className="flex-1 h-1 bg-white/[0.04] rounded-full overflow-hidden">
-            <div
-              className={`h-full rounded-full transition-all duration-700 ${
-                conf >= 75 ? 'bg-green-500' : conf >= 50 ? 'bg-yellow-500' : 'bg-red-500'
-              }`}
-              style={{ width: `${conf}%` }}
-            />
-          </div>
-          <span className="text-[10px] font-mono text-gray-600">{conf}%</span>
+      {/* Confidence bar (always visible) */}
+      <div className="flex items-center gap-2 mb-3">
+        <span className="text-[9px] text-gray-600 shrink-0">Conf</span>
+        <div className="flex-1 h-1.5 bg-white/[0.04] rounded-full overflow-hidden">
+          <div
+            className={`h-full rounded-full transition-all duration-700 ${
+              conf >= 75 ? 'bg-green-500' : conf >= 50 ? 'bg-yellow-500' : 'bg-red-500'
+            }`}
+            style={{ width: `${conf}%` }}
+          />
         </div>
-      )}
+        <span className={`text-[10px] font-mono ${conf >= 60 ? 'text-gray-400' : 'text-gray-600'}`}>{conf}%</span>
+      </div>
 
       {/* Account overview */}
       <div className="pt-2 border-t border-white/[0.04]">
-        {/* Row 1: Total account + P&L + % */}
+        {/* Row 1: Total account + Trade Log P&L */}
         <div className="flex items-baseline justify-between">
           <div className="flex items-baseline gap-1.5">
             <span className="text-2xl font-bold font-mono text-gray-100">
@@ -96,12 +100,17 @@ export default function BotStatus({ status }) {
             </span>
             <span className="text-[10px] text-gray-600">total</span>
           </div>
-          <div className="flex items-baseline gap-2">
-            <span className={`text-lg font-bold font-mono ${pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+          <div className="flex items-baseline gap-3">
+            {/* Total P&L from trade log (actual Kalshi data) */}
+            <div className="flex items-baseline gap-1">
+              <span className={`text-lg font-bold font-mono ${totalTradePnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                {totalTradePnl >= 0 ? '+' : ''}{totalTradePnl.toFixed(2)}
+              </span>
+              <span className="text-[9px] text-gray-600">{totalTrades}t</span>
+            </div>
+            {/* Session P&L */}
+            <span className={`text-sm font-mono ${pnl >= 0 ? 'text-green-400/60' : 'text-red-400/60'}`}>
               {pnl >= 0 ? '+' : ''}{pnl.toFixed(2)}
-            </span>
-            <span className={`text-sm font-semibold font-mono ${pnlPct >= 0 ? 'text-green-400/70' : 'text-red-400/70'}`}>
-              {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(1)}%
             </span>
           </div>
         </div>

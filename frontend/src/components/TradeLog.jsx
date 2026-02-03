@@ -83,6 +83,9 @@ function TradeGroup({ group }) {
   const totalQty = settled ? settled.quantity : buys.reduce((s, e) => s + e.quantity, 0)
   const side = settled ? settled.side : buys[0]?.side || '?'
   const pnl = settled?.pnl
+  const cost = settled?.cost
+  const revenue = settled?.revenue
+  const fees = settled?.fees
   const isOpen = !settled
   const ts = settled?.ts || entries[0]?.ts
 
@@ -119,6 +122,14 @@ function TradeGroup({ group }) {
 
       {open && (
         <div className="ml-4 pl-2 border-l border-white/[0.06] space-y-0.5 pb-1">
+          {/* Cost/Revenue/Fees breakdown for live trades */}
+          {cost != null && revenue != null && (
+            <div className="flex items-center gap-3 text-[9px] font-mono text-gray-500 py-1 mb-1 border-b border-white/[0.04]">
+              <span>Cost: <span className="text-red-400/70">${cost.toFixed(2)}</span></span>
+              <span>Payout: <span className="text-green-400/70">${revenue.toFixed(2)}</span></span>
+              {fees > 0 && <span>Fees: <span className="text-amber-400/70">${fees.toFixed(2)}</span></span>}
+            </div>
+          )}
           {chronological.map((t, i) => {
             const actionColor =
               t.action === 'BUY'

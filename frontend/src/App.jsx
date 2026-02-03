@@ -16,7 +16,7 @@ export default function App() {
   const { data: status, refresh: refreshStatus } = usePolling(fetchStatus, 2000)
   const { data: logs } = usePolling(fetchLogs, 3000)
   const tradeMode = status?.paper_mode ? 'paper' : 'live'
-  const { data: tradeData } = usePolling(() => fetchTrades(tradeMode), 5000)
+  const { data: tradeData } = usePolling(() => fetchTrades(tradeMode), 2000)
 
   if (!status) {
     return (
@@ -33,7 +33,7 @@ export default function App() {
     <div className="min-h-screen max-w-2xl mx-auto px-4 py-6 md:py-10">
       <Header status={status} onAction={refreshStatus} />
       <ContractCard status={status} />
-      <BotStatus status={status} />
+      <BotStatus status={status} tradeData={tradeData} />
       <ExchangeMonitor status={status} />
       <AlphaDashboard status={status} />
       <TradeLog tradeData={tradeData} mode={tradeMode} />

@@ -99,7 +99,29 @@ def init_db():
                 hold_duration_s REAL,
                 entry_price_cents INTEGER
             );
+            CREATE TABLE IF NOT EXISTS live_market_pnl (
+                market_id       TEXT PRIMARY KEY,
+                pnl_cents       REAL NOT NULL,
+                result          TEXT,
+                total_cost_cents REAL,
+                total_revenue_cents REAL,
+                fees_cents      REAL,
+                updated_at      TEXT NOT NULL
+            );
         """)
+        # Migration: add new columns to live_market_pnl if they don't exist
+        try:
+            conn.execute("ALTER TABLE live_market_pnl ADD COLUMN total_cost_cents REAL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        try:
+            conn.execute("ALTER TABLE live_market_pnl ADD COLUMN total_revenue_cents REAL")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE live_market_pnl ADD COLUMN fees_cents REAL")
+        except sqlite3.OperationalError:
+            pass
 
 
 def log_event(level: str, message: str):
@@ -143,6 +165,56 @@ def get_recent_logs(limit: int = 50) -> list[dict]:
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def set_live_market_pnl(market_id: str, pnl_cents: float, result: str | None,
+                        total_cost_cents: float = 0, total_revenue_cents: float = 0,
+                        fees_cents: float = 0):
+    """Store the actual P&L and breakdown from Kalshi for a live market."""
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO live_market_pnl "
+            "(market_id, pnl_cents, result, total_cost_cents, total_revenue_cents, fees_cents, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (market_id, pnl_cents, result, total_cost_cents, total_revenue_cents, fees_cents,
+             datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def get_live_market_pnl(market_id: str) -> float | None:
+    """Get the actual P&L from Kalshi for a live market."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT pnl_cents FROM live_market_pnl WHERE market_id = ?",
+            (market_id,),
+        ).fetchone()
+    return row["pnl_cents"] / 100.0 if row else None
+
+
+def get_all_live_market_pnl() -> dict[str, float]:
+    """Get all live market P&L as a dict {market_id: pnl_dollars}."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT market_id, pnl_cents FROM live_market_pnl").fetchall()
+    return {r["market_id"]: r["pnl_cents"] / 100.0 for r in rows}
+
+
+def get_all_live_market_details() -> dict[str, dict]:
+    """Get all live market details including cost, revenue, fees."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT market_id, pnl_cents, result, total_cost_cents, total_revenue_cents, fees_cents "
+            "FROM live_market_pnl"
+        ).fetchall()
+    return {
+        r["market_id"]: {
+            "pnl": r["pnl_cents"] / 100.0 if r["pnl_cents"] else 0,
+            "result": r["result"],
+            "cost": r["total_cost_cents"] / 100.0 if r["total_cost_cents"] else 0,
+            "revenue": r["total_revenue_cents"] / 100.0 if r["total_revenue_cents"] else 0,
+            "fees": r["fees_cents"] / 100.0 if r["fees_cents"] else 0,
+        }
+        for r in rows
+    }
 
 
 def get_recent_trades(limit: int = 20) -> list[dict]:
@@ -236,6 +308,9 @@ def get_trades_with_pnl(limit: int = 0, mode: str = "") -> dict:
 
     By default returns ALL trades (limit=0). Pass a positive limit to cap results.
     mode: "paper" = only [PAPER] trades, "live" = only non-[PAPER] trades, "" = all.
+
+    For live trades, uses actual P&L from Kalshi (stored via reconcile).
+    For paper trades, calculates P&L from buy/sell prices.
     """
     with get_db() as conn:
         where = ""
@@ -255,7 +330,11 @@ def get_trades_with_pnl(limit: int = 0, mode: str = "") -> dict:
 
     trades = [dict(r) for r in rows]
 
-    # Group by market_id to compute round-trip P&L
+    # For live mode, get actual P&L and details from Kalshi reconciliation
+    live_details = get_all_live_market_details() if mode == "live" else {}
+    live_pnl = {k: v["pnl"] for k, v in live_details.items()}
+
+    # Group by market_id to track positions
     markets: dict[str, dict] = {}
     for t in trades:
         mid = t["market_id"]
@@ -279,7 +358,12 @@ def get_trades_with_pnl(limit: int = 0, mode: str = "") -> dict:
 
     for mid, m in markets.items():
         if m["has_buy"] and m["has_sell"]:
-            pnl = m["sell_proceeds"] - m["buy_cost"]
+            # For live trades, use actual Kalshi P&L if available
+            if mid in live_pnl:
+                pnl = live_pnl[mid]
+            else:
+                # Fall back to calculated P&L for paper trades or missing data
+                pnl = m["sell_proceeds"] - m["buy_cost"]
             market_pnl[mid] = pnl
             net_pnl += pnl
             if pnl > 0:
@@ -293,11 +377,16 @@ def get_trades_with_pnl(limit: int = 0, mode: str = "") -> dict:
     total_completed = wins + losses
     win_rate = wins / total_completed if total_completed > 0 else 0.0
 
-    # Attach pnl to sell/settled rows
+    # Attach pnl and details to sell/settled rows
     for t in trades:
         mid = t["market_id"]
         if t["action"] in ("SELL", "SETTLED", "SL", "TP", "SETTLE", "EDGE") and mid in market_pnl:
             t["pnl"] = market_pnl[mid]
+            # For live trades, attach cost/revenue/fees breakdown
+            if mid in live_details:
+                t["cost"] = live_details[mid]["cost"]
+                t["revenue"] = live_details[mid]["revenue"]
+                t["fees"] = live_details[mid]["fees"]
         else:
             t["pnl"] = None
 
@@ -474,11 +563,13 @@ def backfill_buy_trades_from_snapshots() -> list[str]:
 
 
 def get_unsettled_entry(market_id: str) -> dict | None:
-    """Return the BUY snapshot for a market only if no exit snapshot exists.
+    """Return the BUY entry for a market only if no exit exists.
 
     Used to detect live positions that expired without an active exit.
+    Checks both trade_snapshots and trades tables for completeness.
     """
     with get_db() as conn:
+        # Check for exit in snapshots
         has_exit = conn.execute(
             "SELECT 1 FROM trade_snapshots WHERE market_id = ? "
             "AND action IN ('SELL', 'SL', 'TP', 'SETTLE', 'SETTLED', 'EDGE') LIMIT 1",
@@ -486,12 +577,31 @@ def get_unsettled_entry(market_id: str) -> dict | None:
         ).fetchone()
         if has_exit:
             return None
+        # Also check trades table for exit
+        has_exit_trades = conn.execute(
+            "SELECT 1 FROM trades WHERE market_id = ? "
+            "AND action IN ('SELL', 'SL', 'TP', 'SETTLE', 'SETTLED', 'EDGE') LIMIT 1",
+            (market_id,),
+        ).fetchone()
+        if has_exit_trades:
+            return None
+
+        # Look for BUY in snapshots first
         row = conn.execute(
             "SELECT ts, price_cents, side, quantity, position_qty FROM trade_snapshots "
             "WHERE market_id = ? AND action = 'BUY' ORDER BY id DESC LIMIT 1",
             (market_id,),
         ).fetchone()
-    return dict(row) if row else None
+        if row:
+            return dict(row)
+
+        # Fallback: look for BUY in trades table
+        trade_row = conn.execute(
+            "SELECT ts, price * 100 as price_cents, side, quantity, quantity as position_qty "
+            "FROM trades WHERE market_id = ? AND action = 'BUY' ORDER BY id DESC LIMIT 1",
+            (market_id,),
+        ).fetchone()
+    return dict(trade_row) if trade_row else None
 
 
 def get_legacy_round_trips(mode: str = "") -> list[dict]:
