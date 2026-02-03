@@ -1054,12 +1054,14 @@ class TradingBot:
 
             # 3. Positions + P&L
             positions = await self.fetch_positions()
-            my_pos = next((p for p in positions if p.get("ticker") == ticker), None)
+            # Filter to only positions with actual quantity (exclude settled positions Kalshi may still return)
+            active_positions = [p for p in positions if (p.get("position", 0) or 0) != 0]
+            my_pos = next((p for p in active_positions if p.get("ticker") == ticker), None)
             self.status["active_position"] = my_pos
 
-            # Total cost of all open positions (cents → dollars)
+            # Total cost of all open positions (cents → dollars) - only count positions with quantity
             total_exposure_cents = sum(
-                p.get("market_exposure", 0) or 0 for p in positions
+                p.get("market_exposure", 0) or 0 for p in active_positions
             )
             total_exposure = total_exposure_cents / 100.0
 
@@ -1789,7 +1791,8 @@ class TradingBot:
 
             # Re-fetch positions after cancel (fills may have occurred since initial fetch)
             positions = await self.fetch_positions()
-            my_pos = next((p for p in positions if p.get("ticker") == ticker), None)
+            active_positions = [p for p in positions if (p.get("position", 0) or 0) != 0]
+            my_pos = next((p for p in active_positions if p.get("ticker") == ticker), None)
             self.status["active_position"] = my_pos
 
             # Check current position to avoid exceeding max
