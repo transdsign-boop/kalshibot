@@ -107,12 +107,12 @@ const GROUPS = [
   },
 ]
 
-export default function ConfigPanel() {
+export default function ConfigPanel({ asset = 'btc', bot = 'paper' }) {
   const [cfgMeta, setCfgMeta] = useState(null)
   const [statusMsg, setStatusMsg] = useState({ text: '', ok: true })
   const [saving, setSaving] = useState(false)
 
-  const refresh = () => fetchConfig().then(setCfgMeta).catch(console.error)
+  const refresh = () => fetchConfig(asset, bot).then(setCfgMeta).catch(console.error)
 
   useEffect(() => {
     refresh()
@@ -120,7 +120,7 @@ export default function ConfigPanel() {
     const handler = () => refresh()
     window.addEventListener('config-updated', handler)
     return () => window.removeEventListener('config-updated', handler)
-  }, [])
+  }, [asset, bot])
 
   function showStatus(text, ok) {
     setStatusMsg({ text, ok })
@@ -130,7 +130,7 @@ export default function ConfigPanel() {
   async function handleFieldChange(key, value) {
     const info = SETTINGS[key] || {}
     try {
-      await postConfig({ [key]: value })
+      await postConfig({ [key]: value }, asset, bot)
       showStatus(`Saved: ${info.label || key}`, true)
     } catch {
       showStatus(`Error saving ${info.label || key}`, false)
@@ -145,7 +145,7 @@ export default function ConfigPanel() {
       for (const [key, spec] of Object.entries(cfgMeta)) {
         updates[key] = spec.value
       }
-      await postConfig(updates)
+      await postConfig(updates, asset, bot)
       showStatus('All settings saved', true)
     } catch {
       showStatus('Error saving', false)

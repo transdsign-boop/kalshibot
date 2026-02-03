@@ -15,16 +15,17 @@ def _safe_pf(gross_win: float, gross_loss: float):
 MIN_SAMPLE_SIZE = 10  # minimum trades per bucket before making suggestions
 
 
-def compute_analytics(mode: str = "") -> dict:
+def compute_analytics(mode: str = "", asset: str = "") -> dict:
     """Compute performance analytics and parameter suggestions.
 
     Always uses the trades table for summary and basic segments (captures all history).
     Adds snapshot-specific segments (vol, edge, confidence, time, trigger) and
     parameter suggestions when enough trade_snapshots exist.
     mode: "paper" = only paper trades, "live" = only live trades, "" = all.
+    asset: Filter by asset ("btc", "eth", "sol"). Empty = all assets.
     """
-    round_trips = get_legacy_round_trips(mode=mode)
-    snapshots = get_completed_snapshots(mode=mode)
+    round_trips = get_legacy_round_trips(mode=mode, asset=asset)
+    snapshots = get_completed_snapshots(mode=mode, asset=asset)
 
     if not round_trips and not snapshots:
         return {"summary": {}, "segments": {}, "suggestions": [], "total_snapshots": 0}

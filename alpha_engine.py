@@ -46,15 +46,15 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Exchange configuration
+# Exchange configuration (per-asset symbols)
 # ---------------------------------------------------------------------------
 
-EXCHANGE_CONFIG = {
+# Base exchange config (weights, roles, options — shared across assets)
+EXCHANGE_BASE_CONFIG = {
     'binance': {
         'weight': 0.35,
         'tier': 1,
         'role': 'lead',
-        'symbol': 'BTC/USDT:USDT',
         'label': 'Binance Futures',
         'ccxt_options': {'defaultType': 'future'},
     },
@@ -62,7 +62,6 @@ EXCHANGE_CONFIG = {
         'weight': 0.20,
         'tier': 1,
         'role': 'lead',
-        'symbol': 'BTC/USDT:USDT',
         'label': 'Bybit Futures',
         'ccxt_options': {'defaultType': 'swap'},
     },
@@ -70,7 +69,6 @@ EXCHANGE_CONFIG = {
         'weight': 0.18,
         'tier': 2,
         'role': 'settlement',
-        'symbol': 'BTC/USD',
         'label': 'Coinbase Spot',
         'ccxt_options': {},
     },
@@ -78,7 +76,6 @@ EXCHANGE_CONFIG = {
         'weight': 0.12,
         'tier': 2,
         'role': 'lead',
-        'symbol': 'BTC/USDT:USDT',
         'label': 'OKX Perpetual',
         'ccxt_options': {'defaultType': 'swap'},
     },
@@ -86,7 +83,6 @@ EXCHANGE_CONFIG = {
         'weight': 0.08,
         'tier': 3,
         'role': 'settlement',
-        'symbol': 'BTC/USD',
         'label': 'Kraken Spot',
         'ccxt_options': {},
     },
@@ -94,28 +90,85 @@ EXCHANGE_CONFIG = {
         'weight': 0.07,
         'tier': 3,
         'role': 'lead',
-        'symbol': 'BTC/USD:BTC',
         'label': 'Deribit Futures',
         'ccxt_options': {},
     },
 }
 
-LEAD_EXCHANGES = {k for k, v in EXCHANGE_CONFIG.items() if v['role'] == 'lead'}
-SETTLEMENT_EXCHANGES = {k for k, v in EXCHANGE_CONFIG.items() if v['role'] == 'settlement'}
+# Per-asset exchange symbols
+ASSET_EXCHANGE_SYMBOLS = {
+    'btc': {
+        'binance': 'BTC/USDT:USDT',
+        'bybit': 'BTC/USDT:USDT',
+        'coinbase': 'BTC/USD',
+        'okx': 'BTC/USDT:USDT',
+        'kraken': 'BTC/USD',
+        'deribit': 'BTC/USD:BTC',
+    },
+    'eth': {
+        'binance': 'ETH/USDT:USDT',
+        'bybit': 'ETH/USDT:USDT',
+        'coinbase': 'ETH/USD',
+        'okx': 'ETH/USDT:USDT',
+        'kraken': 'ETH/USD',
+        'deribit': 'ETH/USD:ETH',
+    },
+    'sol': {
+        'binance': 'SOL/USDT:USDT',
+        'bybit': 'SOL/USDT:USDT',
+        'coinbase': 'SOL/USD',
+        'okx': 'SOL/USDT:USDT',
+        'kraken': 'SOL/USD',
+        # Deribit doesn't have SOL perpetuals - skip
+    },
+}
+
+
+def get_exchange_config(asset: str = 'btc') -> dict:
+    """Build full exchange config with asset-specific symbols.
+
+    Only includes exchanges that have a symbol defined for this asset.
+    """
+    symbols = ASSET_EXCHANGE_SYMBOLS.get(asset, ASSET_EXCHANGE_SYMBOLS['btc'])
+    result = {}
+    for ex_id, base in EXCHANGE_BASE_CONFIG.items():
+        # Only include exchange if it has a symbol for this asset
+        if ex_id not in symbols:
+            continue
+        result[ex_id] = {
+            **base,
+            'symbol': symbols[ex_id],
+        }
+    return result
+
+
+# Default config for backward compatibility
+EXCHANGE_CONFIG = get_exchange_config('btc')
+
+LEAD_EXCHANGES = {k for k, v in EXCHANGE_BASE_CONFIG.items() if v['role'] == 'lead'}
+SETTLEMENT_EXCHANGES = {k for k, v in EXCHANGE_BASE_CONFIG.items() if v['role'] == 'settlement'}
 
 
 class AlphaMonitor:
-    """Long-lived async service that tracks cross-exchange BTC prices."""
+    """Long-lived async service that tracks cross-exchange prices for a single asset."""
 
     RECONNECT_BASE_DELAY = 1.0
     RECONNECT_MAX_DELAY = 30.0
     RECONNECT_JITTER = 0.5
     DELTA_WINDOW_SECONDS = 60
 
-    def __init__(self):
+    def __init__(self, asset: str = "btc"):
+        """Initialize alpha monitor for a specific asset.
+
+        Args:
+            asset: Asset to track ('btc', 'eth', or 'sol')
+        """
+        self.asset = asset
+        self._exchange_config = get_exchange_config(asset)
+
         # Per-exchange prices and connection status
-        self.prices: dict[str, float] = {ex: 0.0 for ex in EXCHANGE_CONFIG}
-        self._exchange_connected: dict[str, bool] = {ex: False for ex in EXCHANGE_CONFIG}
+        self.prices: dict[str, float] = {ex: 0.0 for ex in self._exchange_config}
+        self._exchange_connected: dict[str, bool] = {ex: False for ex in self._exchange_config}
 
         # Weighted global price (updated on every tick)
         self._weighted_price: float = 0.0
@@ -182,22 +235,24 @@ class AlphaMonitor:
             return
         self._running = True
 
+        asset_label = self.asset.upper()
+
         if HAS_CCXT:
-            exchanges = list(EXCHANGE_CONFIG.keys())
-            log_event("ALPHA", f"Alpha Engine starting — {len(exchanges)} exchanges via ccxt.pro + Kalshi WS")
+            exchanges = list(self._exchange_config.keys())
+            log_event("ALPHA", f"Alpha Engine [{asset_label}] starting — {len(exchanges)} exchanges via ccxt.pro + Kalshi WS", self.asset)
             self._tasks = [
-                asyncio.create_task(self._stream_exchange(ex), name=f"alpha-{ex}")
+                asyncio.create_task(self._stream_exchange(ex), name=f"alpha-{self.asset}-{ex}")
                 for ex in exchanges
             ]
         else:
-            log_event("ALPHA", "Alpha Engine starting — ccxt not available, fallback to raw WS (Binance + Coinbase)")
+            log_event("ALPHA", f"Alpha Engine [{asset_label}] starting — ccxt not available, fallback to raw WS (Binance + Coinbase)", self.asset)
             self._tasks = [
-                asyncio.create_task(self._binance_loop_fallback(), name="alpha-binance"),
-                asyncio.create_task(self._coinbase_loop_fallback(), name="alpha-coinbase"),
+                asyncio.create_task(self._binance_loop_fallback(), name=f"alpha-{self.asset}-binance"),
+                asyncio.create_task(self._coinbase_loop_fallback(), name=f"alpha-{self.asset}-coinbase"),
             ]
 
         self._tasks.append(
-            asyncio.create_task(self._kalshi_loop(), name="alpha-kalshi")
+            asyncio.create_task(self._kalshi_loop(), name=f"alpha-{self.asset}-kalshi")
         )
 
     async def stop(self):
@@ -207,11 +262,11 @@ class AlphaMonitor:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
-        for ex in EXCHANGE_CONFIG:
+        for ex in self._exchange_config:
             self._exchange_connected[ex] = False
         self.kalshi_connected = False
         self._kalshi_ws = None
-        log_event("ALPHA", "Alpha Engine stopped")
+        log_event("ALPHA", f"Alpha Engine [{self.asset.upper()}] stopped", self.asset)
 
     # ------------------------------------------------------------------
     # ccxt.pro exchange streams
@@ -219,7 +274,7 @@ class AlphaMonitor:
 
     async def _stream_exchange(self, exchange_id: str):
         """Stream prices from a single exchange via ccxt.pro with auto-reconnect."""
-        cfg = EXCHANGE_CONFIG[exchange_id]
+        cfg = self._exchange_config[exchange_id]
         delay = self.RECONNECT_BASE_DELAY
 
         while self._running:
@@ -235,9 +290,14 @@ class AlphaMonitor:
                 # Load markets before watching tickers
                 await exchange.load_markets()
 
+                # Check if symbol exists on this exchange
+                if symbol not in exchange.markets:
+                    log_event("ALPHA", f"{cfg['label']} does not have {symbol} — skipping", self.asset)
+                    return  # Exit cleanly, don't retry
+
                 self._exchange_connected[exchange_id] = True
                 delay = self.RECONNECT_BASE_DELAY
-                log_event("ALPHA", f"{cfg['label']} connected")
+                log_event("ALPHA", f"{cfg['label']} connected ({symbol})", self.asset)
 
                 while self._running:
                     ticker = await exchange.watch_ticker(symbol)
@@ -263,7 +323,12 @@ class AlphaMonitor:
                 break
             except Exception as exc:
                 self._exchange_connected[exchange_id] = False
-                log_event("ALPHA", f"{cfg['label']} error: {exc} — reconnecting in {delay:.1f}s")
+                # Check for BadSymbol errors - don't retry indefinitely
+                exc_name = type(exc).__name__
+                if 'BadSymbol' in exc_name or 'symbol' in str(exc).lower():
+                    log_event("ALPHA", f"{cfg['label']} symbol {cfg['symbol']} not found — skipping", self.asset)
+                    return  # Exit cleanly
+                log_event("ALPHA", f"{cfg['label']} error: {exc} — reconnecting in {delay:.1f}s", self.asset)
                 jitter = delay * self.RECONNECT_JITTER * random.random()
                 await asyncio.sleep(delay + jitter)
                 delay = min(delay * 2, self.RECONNECT_MAX_DELAY)
@@ -292,7 +357,7 @@ class AlphaMonitor:
                 ) as ws:
                     self._exchange_connected['binance'] = True
                     delay = self.RECONNECT_BASE_DELAY
-                    log_event("ALPHA", "Binance WS connected (fallback)")
+                    log_event("ALPHA", "Binance WS connected (fallback)", self.asset)
                     async for raw_msg in ws:
                         if not self._running:
                             break
@@ -310,7 +375,7 @@ class AlphaMonitor:
                 break
             except Exception as exc:
                 self._exchange_connected['binance'] = False
-                log_event("ALPHA", f"Binance WS error: {exc} — reconnecting in {delay:.1f}s")
+                log_event("ALPHA", f"Binance WS error: {exc} — reconnecting in {delay:.1f}s", self.asset)
                 jitter = delay * self.RECONNECT_JITTER * random.random()
                 await asyncio.sleep(delay + jitter)
                 delay = min(delay * 2, self.RECONNECT_MAX_DELAY)
@@ -330,7 +395,7 @@ class AlphaMonitor:
                     }))
                     self._exchange_connected['coinbase'] = True
                     delay = self.RECONNECT_BASE_DELAY
-                    log_event("ALPHA", "Coinbase WS connected (fallback)")
+                    log_event("ALPHA", "Coinbase WS connected (fallback)", self.asset)
                     async for raw_msg in ws:
                         if not self._running:
                             break
@@ -351,7 +416,7 @@ class AlphaMonitor:
                 break
             except Exception as exc:
                 self._exchange_connected['coinbase'] = False
-                log_event("ALPHA", f"Coinbase WS error: {exc} — reconnecting in {delay:.1f}s")
+                log_event("ALPHA", f"Coinbase WS error: {exc} — reconnecting in {delay:.1f}s", self.asset)
                 jitter = delay * self.RECONNECT_JITTER * random.random()
                 await asyncio.sleep(delay + jitter)
                 delay = min(delay * 2, self.RECONNECT_MAX_DELAY)
@@ -407,7 +472,7 @@ class AlphaMonitor:
                     self.kalshi_connected = True
                     self._kalshi_subscribed_ob = set()
                     delay = self.RECONNECT_BASE_DELAY
-                    log_event("ALPHA", "Kalshi WS connected")
+                    log_event("ALPHA", "Kalshi WS connected", self.asset)
 
                     await ws.send(json.dumps({
                         "id": 1,
@@ -459,7 +524,7 @@ class AlphaMonitor:
                             elif msg_type == "fill":
                                 self.kalshi_fills.append(msg)
                                 self.kalshi_fills = self.kalshi_fills[-50:]
-                                log_event("TRADE", f"WS fill: {msg.get('side','')} {msg.get('count',0)}x @ {msg.get('yes_price', msg.get('no_price','?'))}c on {msg.get('ticker','')}")
+                                log_event("TRADE", f"WS fill: {msg.get('side','')} {msg.get('count',0)}x @ {msg.get('yes_price', msg.get('no_price','?'))}c on {msg.get('ticker','')}", self.asset)
 
                                 # Record fill to database
                                 try:
@@ -480,7 +545,7 @@ class AlphaMonitor:
                                             exit_type=None  # Will be set by close_position if it's an exit
                                         )
                                 except Exception as e:
-                                    log_event("ERROR", f"Failed to record WS fill: {e}")
+                                    log_event("ERROR", f"Failed to record WS fill: {e}", self.asset)
 
                         except (json.JSONDecodeError, ValueError, KeyError):
                             pass
@@ -490,7 +555,7 @@ class AlphaMonitor:
             except Exception as exc:
                 self.kalshi_connected = False
                 self._kalshi_ws = None
-                log_event("ALPHA", f"Kalshi WS error: {exc} — reconnecting in {delay:.1f}s")
+                log_event("ALPHA", f"Kalshi WS error: {exc} — reconnecting in {delay:.1f}s", self.asset)
                 jitter = delay * self.RECONNECT_JITTER * random.random()
                 await asyncio.sleep(delay + jitter)
                 delay = min(delay * 2, self.RECONNECT_MAX_DELAY)
@@ -512,9 +577,9 @@ class AlphaMonitor:
                     },
                 }))
                 self._kalshi_subscribed_ob.add(ticker)
-                log_event("ALPHA", f"Subscribed to orderbook for {ticker}")
+                log_event("ALPHA", f"Subscribed to orderbook for {ticker}", self.asset)
             except Exception as exc:
-                log_event("ALPHA", f"Failed to subscribe orderbook for {ticker}: {exc}")
+                log_event("ALPHA", f"Failed to subscribe orderbook for {ticker}: {exc}", self.asset)
 
     def get_live_orderbook(self, ticker: str, max_age: float = 5.0) -> dict | None:
         """Return WS orderbook only if it was updated within max_age seconds."""
@@ -548,10 +613,10 @@ class AlphaMonitor:
         valid = {k: v for k, v in self.prices.items() if v > 0}
         if not valid:
             return 0.0
-        total_weight = sum(EXCHANGE_CONFIG[k]['weight'] for k in valid)
+        total_weight = sum(self._exchange_config[k]['weight'] for k in valid)
         if total_weight <= 0:
             return 0.0
-        return sum(valid[k] * EXCHANGE_CONFIG[k]['weight'] for k in valid) / total_weight
+        return sum(valid[k] * self._exchange_config[k]['weight'] for k in valid) / total_weight
 
     def get_lead_vs_settlement(self) -> tuple[float, float, float]:
         """Compare lead exchange prices to settlement exchange prices.
@@ -566,11 +631,11 @@ class AlphaMonitor:
         if not lead_valid or not settle_valid:
             return 0.0, 0.0, 0.0
 
-        lead_w = {k: EXCHANGE_CONFIG[k]['weight'] for k in lead_valid}
+        lead_w = {k: self._exchange_config[k]['weight'] for k in lead_valid}
         lead_total = sum(lead_w.values())
         lead_price = sum(lead_valid[k] * lead_w[k] for k in lead_valid) / lead_total
 
-        settle_w = {k: EXCHANGE_CONFIG[k]['weight'] for k in settle_valid}
+        settle_w = {k: self._exchange_config[k]['weight'] for k in settle_valid}
         settle_total = sum(settle_w.values())
         settle_price = sum(settle_valid[k] * settle_w[k] for k in settle_valid) / settle_total
 
@@ -877,9 +942,11 @@ class AlphaMonitor:
 
     def get_status(self) -> dict:
         connected_count = sum(1 for v in self._exchange_connected.values() if v)
-        total_count = len(EXCHANGE_CONFIG)
+        total_count = len(self._exchange_config)
 
         return {
+            # Asset identifier
+            "asset": self.asset,
             # Legacy fields
             "binance_price": self.binance_price,
             "coinbase_price": self.coinbase_price,
@@ -899,12 +966,12 @@ class AlphaMonitor:
                 ex: {
                     "price": self.prices[ex],
                     "connected": self._exchange_connected[ex],
-                    "weight": EXCHANGE_CONFIG[ex]['weight'],
-                    "tier": EXCHANGE_CONFIG[ex]['tier'],
-                    "role": EXCHANGE_CONFIG[ex]['role'],
-                    "label": EXCHANGE_CONFIG[ex]['label'],
+                    "weight": self._exchange_config[ex]['weight'],
+                    "tier": self._exchange_config[ex]['tier'],
+                    "role": self._exchange_config[ex]['role'],
+                    "label": self._exchange_config[ex]['label'],
                 }
-                for ex in EXCHANGE_CONFIG
+                for ex in self._exchange_config
             },
             "has_ccxt": HAS_CCXT,
             # Rule-based strategy metrics

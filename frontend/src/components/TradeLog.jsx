@@ -77,7 +77,7 @@ function TradeGroup({ group }) {
   const isPaper = market_id.startsWith('[PAPER]')
   const ticker = market_id
     .replace('[PAPER] ', '')
-    .replace('KXBTC15M-', '')
+    .replace(/^KX(BTC|ETH|SOL)15M-/, '')
 
   const buys = entries.filter((e) => e.action === 'BUY')
   const totalQty = settled ? settled.quantity : buys.reduce((s, e) => s + e.quantity, 0)

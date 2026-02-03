@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { postChat } from '../api'
 
-export default function ChatPanel() {
+export default function ChatPanel({ asset = 'btc', bot = 'paper' }) {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
@@ -22,7 +22,7 @@ export default function ChatPanel() {
     setSending(true)
 
     try {
-      const data = await postChat(msg)
+      const data = await postChat(msg, asset, bot)
       setMessages(prev => [...prev, { role: 'agent', text: data.reply }])
     } catch (err) {
       setMessages(prev => [...prev, { role: 'error', text: err.message }])

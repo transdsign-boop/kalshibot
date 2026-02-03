@@ -1,25 +1,14 @@
 import { useState } from 'react'
-import { postControl, postEnv, postPaperReset } from '../api'
+import { postControl, postPaperReset } from '../api'
 
-export default function Header({ status, onAction }) {
-  const { running, env, paper_mode } = status
+export default function Header({ status, onAction, asset = 'btc', bot = 'paper' }) {
+  const { running, paper_mode } = status
   const [loading, setLoading] = useState(false)
 
   async function handleControl(action) {
     setLoading(true)
     try {
-      await postControl(action)
-      setTimeout(onAction, 300)
-    } finally {
-      setTimeout(() => setLoading(false), 500)
-    }
-  }
-
-  async function handleEnvSwitch(newEnv) {
-    if (!confirm(`Switch to ${newEnv === 'demo' ? 'PAPER' : 'LIVE'} mode? This will stop the bot if running.`)) return
-    setLoading(true)
-    try {
-      await postEnv(newEnv)
+      await postControl(action, asset, bot)
       setTimeout(onAction, 300)
     } finally {
       setTimeout(() => setLoading(false), 500)
@@ -27,15 +16,17 @@ export default function Header({ status, onAction }) {
   }
 
   async function handlePaperReset() {
-    if (!confirm('Reset paper trading? This will stop the bot, clear all positions, and reset your balance to starting amount.')) return
+    if (!confirm(`Reset ${asset.toUpperCase()} paper trading? This will stop the bot, clear all positions, and reset your balance to starting amount.`)) return
     setLoading(true)
     try {
-      await postPaperReset()
+      await postPaperReset(asset)
       setTimeout(onAction, 300)
     } finally {
       setTimeout(() => setLoading(false), 500)
     }
   }
+
+  const isLive = bot === 'live'
 
   return (
     <header className="flex items-center justify-between mb-6">
@@ -46,8 +37,8 @@ export default function Header({ status, onAction }) {
         <div>
           <h1 className="text-lg font-semibold tracking-tight leading-tight">Up/Down 15</h1>
           <p className="text-[11px] text-gray-500">
-            {env === 'live' ? (
-              <span className="text-red-400 font-medium">LIVE</span>
+            {isLive ? (
+              <span className="text-green-400 font-medium">LIVE</span>
             ) : (
               <span className="text-amber-400 font-medium">PAPER</span>
             )}
@@ -65,13 +56,6 @@ export default function Header({ status, onAction }) {
             Reset
           </button>
         )}
-        <button
-          onClick={() => handleEnvSwitch(env === 'live' ? 'demo' : 'live')}
-          disabled={loading}
-          className="px-2.5 py-1.5 rounded-lg text-[11px] font-medium text-gray-400 hover:text-gray-200 bg-white/[0.04] hover:bg-white/[0.08] transition disabled:opacity-50"
-        >
-          {env === 'live' ? 'Paper' : 'Live'}
-        </button>
         {running ? (
           <button
             onClick={() => handleControl('stop')}
@@ -84,7 +68,11 @@ export default function Header({ status, onAction }) {
           <button
             onClick={() => handleControl('start')}
             disabled={loading}
-            className="px-3 py-1.5 rounded-lg bg-green-500/20 text-green-400 text-xs font-semibold hover:bg-green-500/30 transition disabled:opacity-50"
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition disabled:opacity-50 ${
+              isLive
+                ? 'bg-green-500/20 text-green-400 hover:bg-green-500/30'
+                : 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30'
+            }`}
           >
             {loading ? 'Starting...' : 'Start'}
           </button>

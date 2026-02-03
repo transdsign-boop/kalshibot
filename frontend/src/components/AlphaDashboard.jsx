@@ -33,7 +33,7 @@ function SectionHeader({ title, badge }) {
 }
 
 // Inline-editable threshold: click to edit, Enter/blur to save
-function Editable({ configKey, display, type = 'int', scale = 1 }) {
+function Editable({ configKey, display, type = 'int', scale = 1, asset = 'btc', bot = 'paper' }) {
   const [editing, setEditing] = useState(false)
   const [val, setVal] = useState('')
   const [flash, setFlash] = useState(null) // 'ok' | 'err'
@@ -55,7 +55,7 @@ function Editable({ configKey, display, type = 'int', scale = 1 }) {
     if (isNaN(parsed)) return
     if (scale !== 1) parsed = parsed / scale
     try {
-      await postConfig({ [configKey]: parsed })
+      await postConfig({ [configKey]: parsed }, asset, bot)
       setFlash('ok')
       window.dispatchEvent(new Event('config-updated'))
     } catch {
@@ -91,7 +91,7 @@ function Editable({ configKey, display, type = 'int', scale = 1 }) {
 }
 
 // Toggle for boolean config (e.g., LEAD_LAG_ENABLED)
-function Toggle({ configKey, enabled }) {
+function Toggle({ configKey, enabled, asset = 'btc', bot = 'paper' }) {
   const [flash, setFlash] = useState(null)
 
   useEffect(() => {
@@ -102,7 +102,7 @@ function Toggle({ configKey, enabled }) {
 
   const toggle = async () => {
     try {
-      await postConfig({ [configKey]: !enabled })
+      await postConfig({ [configKey]: !enabled }, asset, bot)
       setFlash('ok')
     } catch {
       setFlash('err')
@@ -164,7 +164,7 @@ function MiniMeter({ value, max = 100, color = 'blue', label }) {
   )
 }
 
-export default function AlphaDashboard({ status }) {
+export default function AlphaDashboard({ status, asset = 'btc', bot = 'paper' }) {
   const db = status.dashboard
   const alpha = status.alpha || {}
   const ob = status.orderbook || {}
@@ -222,6 +222,8 @@ export default function AlphaDashboard({ status }) {
   // --- Confidence ---
   const confidence = status.confidence || 0
   const confPct = Math.round(confidence * 100)
+  const rollingAvgConf = db.rolling_avg_confidence || 0
+  const rollingAvgConfPct = Math.round(rollingAvgConf * 100)
   const minConf = db.min_confidence || 0.6
   const minConfPct = Math.round(minConf * 100)
   const confAbove = confidence >= minConf
@@ -239,17 +241,17 @@ export default function AlphaDashboard({ status }) {
   // --- Guards ---
   const guardEntries = [
     { key: 'time', label: 'Time', g: guards.time, fmt: g => `${g.value}s`,
-      th: g => <Editable configKey="MIN_SECONDS_TO_CLOSE" display={`>${g.threshold}s`} /> },
+      th: g => <Editable configKey="MIN_SECONDS_TO_CLOSE" display={`>${g.threshold}s`} asset={asset} bot={bot} /> },
     { key: 'spread', label: 'Spread', g: guards.spread, fmt: g => `${g.value}c`,
-      th: g => <Editable configKey="MAX_SPREAD_CENTS" display={`<${g.threshold}c`} /> },
+      th: g => <Editable configKey="MAX_SPREAD_CENTS" display={`<${g.threshold}c`} asset={asset} bot={bot} /> },
     { key: 'daily_loss', label: 'Daily Loss', g: guards.daily_loss, fmt: g => `$${g.value}`,
       th: () => <span className="text-[10px] font-mono text-gray-600 flex-shrink-0">auto</span> },
     { key: 'hold_expiry', label: 'Hold Expiry', g: guards.hold_expiry, fmt: g => `${g.value}s`,
-      th: g => <Editable configKey="HOLD_EXPIRY_SECS" display={`>${g.threshold}s`} /> },
+      th: g => <Editable configKey="HOLD_EXPIRY_SECS" display={`>${g.threshold}s`} asset={asset} bot={bot} /> },
     { key: 'price_min', label: 'Price Min', g: guards.price_min, fmt: g => `Y:${g.value_yes}c N:${g.value_no}c`,
-      th: g => <Editable configKey="MIN_CONTRACT_PRICE" display={`>${g.threshold}c`} /> },
+      th: g => <Editable configKey="MIN_CONTRACT_PRICE" display={`>${g.threshold}c`} asset={asset} bot={bot} /> },
     { key: 'price_max', label: 'Price Max', g: guards.price_max, fmt: g => `Y:${g.value_yes}c N:${g.value_no}c`,
-      th: g => <Editable configKey="MAX_CONTRACT_PRICE" display={`<${g.threshold}c`} /> },
+      th: g => <Editable configKey="MAX_CONTRACT_PRICE" display={`<${g.threshold}c`} asset={asset} bot={bot} /> },
     { key: 'exposure', label: 'Exposure', g: guards.exposure, fmt: g => `$${g.value}`,
       th: g => <span className="text-[10px] font-mono text-gray-600 flex-shrink-0">{`<$${g.threshold}`}</span> },
     { key: 'position_size', label: 'Position', g: guards.position_size, fmt: g => `${g.value}/${g.threshold}`,
@@ -278,18 +280,18 @@ export default function AlphaDashboard({ status }) {
     { key: 'stop_loss', label: 'Stop-Loss', e: exits.stop_loss, fmt: e => `${e.value}c loss`,
       th: e => <span className="text-[10px] text-gray-400 font-mono">{e.threshold}c</span> },
     { key: 'hit_and_run', label: 'Hit & Run', e: exits.hit_and_run, fmt: e => `${e.value}% gain`,
-      th: e => <Editable configKey="HIT_RUN_PCT" display={e.enabled ? `${e.threshold}%` : 'OFF'} type="float" /> },
+      th: e => <Editable configKey="HIT_RUN_PCT" display={e.enabled ? `${e.threshold}%` : 'OFF'} type="float" asset={asset} bot={bot} /> },
     { key: 'profit_take', label: 'Profit Take', e: exits.profit_take, fmt: e => `${e.value}% gain`,
-      th: e => <Editable configKey="PROFIT_TAKE_PCT" display={`${e.threshold}%`} /> },
+      th: e => <Editable configKey="PROFIT_TAKE_PCT" display={`${e.threshold}%`} asset={asset} bot={bot} /> },
     { key: 'free_roll', label: 'Free Roll', e: exits.free_roll, fmt: e => `${e.value}c (${e.qty}x)`,
-      th: e => <Editable configKey="FREE_ROLL_PRICE" display={`${e.threshold}c`} /> },
+      th: e => <Editable configKey="FREE_ROLL_PRICE" display={`${e.threshold}c`} asset={asset} bot={bot} /> },
     { key: 'edge_exit', label: 'Edge Exit', e: exits.edge_exit,
       fmt: e => `${e.remaining_edge}c edge / ${e.threshold}c thr`,
-      th: e => <Editable configKey="EDGE_EXIT_THRESHOLD_CENTS" display={`${db.edge_exit_threshold || 2}c`} />,
+      th: e => <Editable configKey="EDGE_EXIT_THRESHOLD_CENTS" display={`${db.edge_exit_threshold || 2}c`} asset={asset} bot={bot} />,
       badge: e => (
         <span className="flex items-center gap-1">
           {e.count > 0 && <span className="text-[9px] font-bold px-1 py-0.5 rounded bg-amber-500/15 text-amber-400">{e.count}x</span>}
-          <Toggle configKey="EDGE_EXIT_ENABLED" enabled={e.enabled} />
+          <Toggle configKey="EDGE_EXIT_ENABLED" enabled={e.enabled} asset={asset} bot={bot} />
         </span>
       ),
     },
@@ -326,12 +328,25 @@ export default function AlphaDashboard({ status }) {
       {/* Always-visible confidence meter at top */}
       <div className="flex items-center gap-2 pb-2 mb-1 border-b border-white/[0.04]">
         <span className="text-[10px] text-gray-500 shrink-0">Confidence</span>
-        <div className="flex-1 h-2 bg-white/[0.04] rounded-full overflow-hidden relative">
-          <div className="absolute top-0 bottom-0 w-px bg-gray-500/50 z-10" style={{ left: `${minConfPct}%` }} />
-          <div
-            className={`h-full rounded-full transition-all duration-500 ${confAbove ? 'bg-green-500' : confPct > minConfPct * 0.7 ? 'bg-amber-500' : 'bg-red-500'}`}
-            style={{ width: `${confPct}%` }}
-          />
+        <div className="flex-1 relative">
+          {/* Rolling average dot marker above the meter */}
+          {rollingAvgConfPct > 0 && (
+            <div
+              className="absolute -top-1.5 transform -translate-x-1/2 z-20"
+              style={{ left: `${rollingAvgConfPct}%` }}
+              title={`Rolling avg: ${rollingAvgConfPct}% (${db.confidence_sample_count || 0} samples)`}
+            >
+              <div className="w-2 h-2 rounded-full bg-blue-400 border border-blue-300 shadow-sm" />
+            </div>
+          )}
+          {/* Meter bar */}
+          <div className="h-2 bg-white/[0.04] rounded-full overflow-hidden relative">
+            <div className="absolute top-0 bottom-0 w-px bg-gray-500/50 z-10" style={{ left: `${minConfPct}%` }} />
+            <div
+              className={`h-full rounded-full transition-all duration-500 ${confAbove ? 'bg-green-500' : confPct > minConfPct * 0.7 ? 'bg-amber-500' : 'bg-red-500'}`}
+              style={{ width: `${confPct}%` }}
+            />
+          </div>
         </div>
         <span className={`text-sm font-mono font-bold shrink-0 ${confAbove ? 'text-green-400' : 'text-gray-500'}`}>{confPct}%</span>
         <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded shrink-0 ${decisionColors[decision] || decisionColors.HOLD}`}>{decision.replace('_', ' ')}</span>
@@ -343,21 +358,21 @@ export default function AlphaDashboard({ status }) {
           dot={leadLagDot}
           label="Lead-Lag"
           value={`${signal} ${signalDiff !== 0 ? (signalDiff > 0 ? '+' : '') + signalDiff.toFixed(0) : ''}`}
-          threshold={<Editable configKey="LEAD_LAG_THRESHOLD" display={`\u00b1$${db.lead_lag_threshold || 75}`} />}
-          badge={<Toggle configKey="LEAD_LAG_ENABLED" enabled={db.lead_lag_enabled} />}
+          threshold={<Editable configKey="LEAD_LAG_THRESHOLD" display={`\u00b1$${db.lead_lag_threshold || 75}`} asset={asset} bot={bot} />}
+          badge={<Toggle configKey="LEAD_LAG_ENABLED" enabled={db.lead_lag_enabled} asset={asset} bot={bot} />}
         />
         <Row
           dot={momDot}
           label="Momentum"
           value={`${momentum >= 0 ? '+' : ''}${momentum.toFixed(1)}`}
-          threshold={<Editable configKey="DELTA_THRESHOLD" display={`\u00b1$${db.delta_threshold}`} />}
+          threshold={<Editable configKey="DELTA_THRESHOLD" display={`\u00b1$${db.delta_threshold}`} asset={asset} bot={bot} />}
           badge={momBadge}
         />
         <Row
           dot={anchorDot}
           label="Anchor"
           value={anchorActive ? `${Math.round(secsLeft)}s / ${guards.same_side?.holding}` : `${Math.round(secsLeft)}s`}
-          threshold={<Editable configKey="ANCHOR_SECONDS_THRESHOLD" display={`<${db.anchor_seconds_threshold}s`} />}
+          threshold={<Editable configKey="ANCHOR_SECONDS_THRESHOLD" display={`<${db.anchor_seconds_threshold}s`} asset={asset} bot={bot} />}
         />
       </CollapsibleSection>
 
@@ -379,7 +394,7 @@ export default function AlphaDashboard({ status }) {
             />
           </div>
           <span className={`text-[11px] font-mono font-semibold flex-shrink-0 ${confAbove ? 'text-green-400' : 'text-gray-500'}`}>{confPct}%</span>
-          <Editable configKey="RULE_MIN_CONFIDENCE" display={`≥${minConfPct}%`} type="float" scale={100} />
+          <Editable configKey="RULE_MIN_CONFIDENCE" display={`≥${minConfPct}%`} type="float" scale={100} asset={asset} bot={bot} />
         </div>
         <Row
           dot={fairCents != null && midpoint != null && Math.abs(fairCents - midpoint) >= minEdge ? 'green' : 'gray'}
@@ -391,7 +406,7 @@ export default function AlphaDashboard({ status }) {
           dot={hasEdge ? 'green' : 'gray'}
           label="Edge"
           value={`Y:${yesEdge >= 0 ? '+' : ''}${yesEdge}c  N:${noEdge >= 0 ? '+' : ''}${noEdge}c`}
-          threshold={<Editable configKey="MIN_EDGE_CENTS" display={`\u2265${minEdge}c`} />}
+          threshold={<Editable configKey="MIN_EDGE_CENTS" display={`\u2265${minEdge}c`} asset={asset} bot={bot} />}
         />
         <Row
           dot={vol.regime === 'high' ? 'purple' : vol.regime === 'low' ? 'gray' : 'amber'}

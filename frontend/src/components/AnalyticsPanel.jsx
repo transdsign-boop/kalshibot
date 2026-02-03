@@ -124,7 +124,7 @@ function SuggestionCard({ suggestion, onApply }) {
   )
 }
 
-export default function AnalyticsPanel({ mode = '' }) {
+export default function AnalyticsPanel({ mode = '', asset = '' }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
   const [statusMsg, setStatusMsg] = useState(null)
@@ -132,7 +132,7 @@ export default function AnalyticsPanel({ mode = '' }) {
   const refresh = async () => {
     setLoading(true)
     try {
-      const result = await fetchAnalytics(mode)
+      const result = await fetchAnalytics(mode, asset)
       setData(result)
     } catch (err) {
       console.error('Analytics fetch failed:', err)
@@ -140,7 +140,7 @@ export default function AnalyticsPanel({ mode = '' }) {
     setLoading(false)
   }
 
-  useEffect(() => { refresh() }, [mode])
+  useEffect(() => { refresh() }, [mode, asset])
 
   if (!data || !data.summary || !data.summary.total_trades) {
     return (
@@ -186,7 +186,7 @@ export default function AnalyticsPanel({ mode = '' }) {
             {suggestions.map((s, i) => (
               <SuggestionCard key={i} suggestion={s} onApply={async () => {
                 try {
-                  await applySuggestion(s.param, s.suggested_value)
+                  await applySuggestion(s.param, s.suggested_value, asset, mode)
                   setStatusMsg({ text: `Applied: ${s.param}`, ok: true })
                   setTimeout(() => setStatusMsg(null), 3000)
                   window.dispatchEvent(new Event('config-updated'))

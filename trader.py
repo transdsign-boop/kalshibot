@@ -3,6 +3,7 @@ import base64
 import json
 import re
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -12,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 import config
 from agent import MarketAgent
-from database import init_db, log_event, record_trade, record_decision, record_snapshot, get_entry_snapshot, get_unsettled_entry, get_setting, set_setting, set_live_market_pnl
+from database import init_db, log_event, record_trade, record_decision, record_snapshot, get_entry_snapshot, get_unsettled_entry, get_setting, set_setting, set_live_market_pnl, get_db
 
 
 def _load_private_key():
@@ -54,24 +55,35 @@ def _sign_request(private_key, method: str, path: str) -> dict:
 
 
 class TradingBot:
-    """Async trading engine for Kalshi BTC 15-min binary markets."""
+    """Async trading engine for Kalshi 15-min binary markets (BTC, ETH, SOL)."""
 
     PATH_PREFIX = "/trade-api/v2"
 
-    def __init__(self, alpha_monitor=None):
+    def __init__(self, alpha_monitor=None, bot_config=None, mode: str = "paper", asset: str = "btc"):
+        """Initialize trading bot.
+
+        Args:
+            alpha_monitor: Shared AlphaMonitor for price feeds
+            bot_config: Per-bot BotConfig instance (optional, creates one if not provided)
+            mode: 'paper' or 'live' - determines trading mode
+            asset: 'btc', 'eth', or 'sol' - which asset to trade
+        """
+        from config import BotConfig, ASSET_CONFIG
         init_db()
 
-        # Restore persisted environment preference (survives restarts)
-        saved_env = get_setting("env")
-        if saved_env and saved_env in ("demo", "live") and saved_env != config.KALSHI_ENV:
-            config.switch_env(saved_env)
+        # Asset configuration
+        self.asset = asset
+        self._asset_config = ASSET_CONFIG.get(asset, ASSET_CONFIG["btc"])
 
-        self.agent = MarketAgent()
+        # Per-bot config (independent settings for paper vs live, per asset)
+        self.cfg = bot_config if bot_config else BotConfig(mode, asset)
+        self.mode = self.cfg.mode
+
+        self.agent = MarketAgent(bot_config=self.cfg)
         self.alpha = alpha_monitor
         self.running = False
         self.http: httpx.AsyncClient | None = None
         self.private_key = _load_private_key()
-        self._active_env = config.KALSHI_ENV
         self._start_balance: float | None = None  # set on first cycle
         self._start_exposure: float = 0.0        # open position cost at start
         self._free_rolled: set[str] = set()      # tickers where we already sold half
@@ -79,10 +91,14 @@ class TradingBot:
         self._edge_exit_ts: dict[str, float] = {}   # ticker -> timestamp of last edge-exit
         self._entry_ts: dict[str, float] = {}        # ticker -> timestamp of entry
         self._entry_edge: dict[str, float] = {}      # ticker -> edge at entry (cents)
+        self._entry_side: dict[str, str] = {}        # ticker -> side we entered ("yes"/"no") - only set on fill
         self._edge_exits_count: dict[str, int] = {}  # ticker -> number of edge-exits this contract
 
-        # Paper trading state (used in demo/paper mode)
-        self._paper_balance: float = config.PAPER_STARTING_BALANCE
+        # Rolling confidence tracker (for threshold calibration)
+        self._confidence_history: deque[float] = deque(maxlen=100)  # last 100 confidence readings
+
+        # Paper trading state (used in paper mode)
+        self._paper_balance: float = self.cfg.PAPER_STARTING_BALANCE
         self._paper_positions: dict[str, dict] = {}  # ticker -> {side, quantity, avg_price_cents, market_exposure_cents}
         self._paper_trades: list[dict] = []
         self._last_paper_ticker: str | None = None
@@ -99,7 +115,8 @@ class TradingBot:
             "last_action": "Idle",
             "last_decision": None,
             "cycle_count": 0,
-            "env": config.KALSHI_ENV,
+            "mode": self.mode,
+            "asset": self.asset,
             "alpha_latency_delta": 0.0,
             "alpha_delta_momentum": 0.0,
             "alpha_delta_baseline": 0.0,
@@ -120,80 +137,78 @@ class TradingBot:
 
     @property
     def paper_mode(self) -> bool:
-        return config.KALSHI_ENV == "demo"
+        return self.mode == "paper"
+
+    def _track_confidence(self, confidence: float):
+        """Track confidence value for rolling average calculation."""
+        # Only track non-zero confidence (actual signal evaluations)
+        if confidence > 0:
+            self._confidence_history.append(confidence)
+
+    def get_rolling_avg_confidence(self) -> float:
+        """Get rolling average of recent confidence values."""
+        if not self._confidence_history:
+            return 0.0
+        return sum(self._confidence_history) / len(self._confidence_history)
+
+    def _log(self, level: str, message: str):
+        """Log an event with the bot's asset context."""
+        log_event(level, message, self.asset)
 
     def _save_paper_state(self):
         """Persist paper balance and positions to DB so state survives restarts."""
-        set_setting("paper_balance", str(self._paper_balance))
-        set_setting("paper_positions", json.dumps(self._paper_positions))
-        set_setting("paper_last_ticker", self._last_paper_ticker or "")
+        # Use asset-prefixed keys for multi-asset support
+        prefix = f"{self.asset}_"
+        set_setting(f"{prefix}paper_balance", str(self._paper_balance))
+        set_setting(f"{prefix}paper_positions", json.dumps(self._paper_positions))
+        set_setting(f"{prefix}paper_last_ticker", self._last_paper_ticker or "")
 
     def _restore_paper_state(self):
         """Restore paper trading state from DB after a restart."""
-        saved_balance = get_setting("paper_balance")
+        # Use asset-prefixed keys, fall back to old keys for migration
+        prefix = f"{self.asset}_"
+        asset_label = self.asset.upper()
+
+        saved_balance = get_setting(f"{prefix}paper_balance")
+        if saved_balance is None:
+            saved_balance = get_setting("paper_balance")  # migration fallback
         if saved_balance is not None:
             try:
                 self._paper_balance = float(saved_balance)
-                log_event("INFO", f"Restored paper balance: ${self._paper_balance:.2f}")
+                self._log("INFO", f"[{asset_label}] Restored paper balance: ${self._paper_balance:.2f}")
             except ValueError:
                 pass
 
-        saved_positions = get_setting("paper_positions")
+        saved_positions = get_setting(f"{prefix}paper_positions")
+        if saved_positions is None:
+            saved_positions = get_setting("paper_positions")  # migration fallback
         if saved_positions:
             try:
                 self._paper_positions = json.loads(saved_positions)
                 if self._paper_positions:
-                    log_event("INFO", f"Restored {len(self._paper_positions)} paper position(s)")
+                    self._log("INFO", f"[{asset_label}] Restored {len(self._paper_positions)} paper position(s)")
             except (json.JSONDecodeError, ValueError):
                 pass
 
-        saved_ticker = get_setting("paper_last_ticker")
+        saved_ticker = get_setting(f"{prefix}paper_last_ticker")
+        if saved_ticker is None:
+            saved_ticker = get_setting("paper_last_ticker")  # migration fallback
         if saved_ticker:
             self._last_paper_ticker = saved_ticker
 
     def reset_paper_trading(self):
         """Reset all paper trading state — balance, positions, and trade history."""
-        self._paper_balance = config.PAPER_STARTING_BALANCE
+        self._paper_balance = self.cfg.PAPER_STARTING_BALANCE
         self._paper_positions = {}
         self._last_paper_ticker = None
         self._start_balance = None
         self._start_exposure = 0.0
         self._save_paper_state()
-        log_event("INFO", f"Paper trading reset — balance: ${config.PAPER_STARTING_BALANCE:.2f}")
+        self._log("INFO", f"Paper trading reset — balance: ${self.cfg.PAPER_STARTING_BALANCE:.2f}")
 
-    async def switch_environment(self, env: str):
-        """Switch between 'demo' and 'live'. Stops the bot, swaps creds, resets client."""
-        was_running = self.running
-        if was_running:
-            self.stop()
-            # Give the loop a moment to exit
-            await asyncio.sleep(1)
-
-        config.switch_env(env)
-        self.private_key = _load_private_key()
-        self._active_env = env
-
-        # Force new HTTP client on next request
-        if self.http and not self.http.is_closed:
-            await self.http.aclose()
-        self.http = None
-
-        self.status["env"] = env
-        self.status["balance"] = 0.0
-        self.status["day_pnl"] = 0.0
-        self.status["active_position"] = None
-        self.status["current_market"] = None
-        self.status["cycle_count"] = 0
-        self._start_balance = None  # reset so P&L recalculates for new env
-        self._start_exposure = 0.0
-        set_setting("env", env)
-
-        # Restore or initialize paper trading state
-        if env == "demo":
-            self._restore_paper_state()
-            log_event("INFO", f"Switched to PAPER mode (balance: ${self._paper_balance:.2f})")
-        else:
-            log_event("INFO", "Switched to LIVE environment")
+    def stop(self):
+        """Signal the bot to stop running."""
+        self.running = False
 
     # ------------------------------------------------------------------
     # HTTP helpers (Kalshi REST API via httpx + RSA-PSS auth)
@@ -223,7 +238,7 @@ class TradingBot:
             except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as exc:
                 if attempt < 2:
                     wait = 2 ** attempt  # 1s, 2s
-                    log_event("ERROR", f"{type(exc).__name__} on {method} {path} — retry {attempt+1}/2 in {wait}s")
+                    self._log("ERROR", f"{type(exc).__name__} on {method} {path} — retry {attempt+1}/2 in {wait}s")
                     await asyncio.sleep(wait)
                     # Force a fresh connection on retry
                     if self.http and not self.http.is_closed:
@@ -254,16 +269,17 @@ class TradingBot:
         return balance_cents / 100.0
 
     async def fetch_active_market(self) -> dict | None:
-        """Find the currently active KXBTC15M market.
+        """Find the currently active market for this asset.
 
         When multiple contracts are open (overlap during settlement), prefer
         the newer contract that still has tradeable time rather than the old
         one that is about to expire.
         """
+        market_series = self._asset_config["market_series"]
         data = await self._get(
             "/markets",
             params={
-                "series_ticker": config.MARKET_SERIES,
+                "series_ticker": market_series,
                 "status": "open",
                 "limit": 5,
             },
@@ -298,8 +314,8 @@ class TradingBot:
         # contract is too close to expiry to trade, skip to the next one.
         # This lets us start trading the new contract immediately instead of
         # waiting for the old one to settle.
-        if candidates[0]["_seconds_to_close"] < config.MIN_SECONDS_TO_CLOSE:
-            log_event("INFO", f"Skipping expiring contract {candidates[0].get('ticker', '?')} ({candidates[0]['_seconds_to_close']:.0f}s left), switching to {candidates[1].get('ticker', '?')}")
+        if candidates[0]["_seconds_to_close"] < self.cfg.MIN_SECONDS_TO_CLOSE:
+            self._log("INFO", f"Skipping expiring contract {candidates[0].get('ticker', '?')} ({candidates[0]['_seconds_to_close']:.0f}s left), switching to {candidates[1].get('ticker', '?')}")
             return candidates[1]
 
         # Otherwise pick the soonest (normal behavior)
@@ -353,7 +369,7 @@ class TradingBot:
             filled_count = order.get("filled_count", 0)
             remaining = order.get("remaining_count", quantity)
 
-            log_event("TRADE", f"Placed {side} limit @ {price_cents}c x{quantity} on {ticker} (status={status})")
+            self._log("TRADE", f"Placed {side} limit @ {price_cents}c x{quantity} on {ticker} (status={status})")
 
             # Only record as a trade if the order actually filled (fully or partially)
             if filled_count > 0:
@@ -365,10 +381,10 @@ class TradingBot:
                     quantity=filled_count,
                     order_id=order_id,
                 )
-                log_event("TRADE", f"Filled {filled_count}x {side} @ {price_cents}c on {ticker}")
+                self._log("TRADE", f"Filled {filled_count}x {side} @ {price_cents}c on {ticker}")
             return order
         except httpx.HTTPStatusError as exc:
-            log_event("ERROR", f"Order rejected: {exc.response.text[:200]}")
+            self._log("ERROR", f"Order rejected: {exc.response.text[:200]}")
             return None
 
     def _simulate_fill(
@@ -382,7 +398,7 @@ class TradingBot:
 
         Returns (filled_qty, avg_price_cents, [(price, qty), ...]).
         """
-        fill_fraction = config.PAPER_FILL_FRACTION
+        fill_fraction = self.cfg.PAPER_FILL_FRACTION
 
         # Determine which book side to consume and price interpretation
         if action == "buy":
@@ -433,7 +449,7 @@ class TradingBot:
         """Simulate a buy order against the live orderbook depth."""
         ob = self._paper_orderbook
         if not ob:
-            log_event("SIM", f"[PAPER] No orderbook available — skipping buy")
+            self._log("SIM", f"[PAPER] No orderbook available — skipping buy")
             return None
 
         filled_qty, avg_price, fills = self._simulate_fill(ob, "buy", side, price_cents, quantity)
@@ -441,7 +457,7 @@ class TradingBot:
             # No crossing fill — order rests on the book (same as live Kalshi behavior).
             # Return a "resting" order so the retry logic can fire and reprice.
             order_id = f"paper-{int(time.time() * 1000)}"
-            log_event("SIM", f"[PAPER] Order resting: {side.upper()} @ {price_cents}c x{quantity} on {ticker} (no crossing liquidity)")
+            self._log("SIM", f"[PAPER] Order resting: {side.upper()} @ {price_cents}c x{quantity} on {ticker} (no crossing liquidity)")
             return {"order_id": order_id, "status": "resting", "filled_count": 0, "remaining_count": quantity}
 
         cost_cents = avg_price * filled_qty
@@ -450,7 +466,7 @@ class TradingBot:
         if cost_dollars > self._paper_balance:
             affordable = int(self._paper_balance * 100 / avg_price) if avg_price > 0 else 0
             if affordable <= 0:
-                log_event("SIM", f"[PAPER] Insufficient balance: need ${cost_dollars:.2f}, have ${self._paper_balance:.2f}")
+                self._log("SIM", f"[PAPER] Insufficient balance: need ${cost_dollars:.2f}, have ${self._paper_balance:.2f}")
                 return None
             filled_qty = affordable
             cost_cents = avg_price * filled_qty
@@ -495,7 +511,7 @@ class TradingBot:
             quantity=filled_qty,
             order_id=order_id,
         )
-        log_event("SIM", f"[PAPER] BUY {filled_qty}x {side.upper()} @ {avg_price}c on {ticker}{partial_str}{slip_str} (cost ${cost_dollars:.2f}, bal ${self._paper_balance:.2f})")
+        self._log("SIM", f"[PAPER] BUY {filled_qty}x {side.upper()} @ {avg_price}c on {ticker}{partial_str}{slip_str} (cost ${cost_dollars:.2f}, bal ${self._paper_balance:.2f})")
         self._save_paper_state()
 
         return {"order_id": order_id, "status": "filled" if remaining == 0 else "partial", "filled_count": filled_qty, "remaining_count": remaining}
@@ -526,7 +542,7 @@ class TradingBot:
             status = order.get("status", "")
             filled_count = order.get("filled_count", 0)
 
-            log_event("TRADE", f"{exit_type} SELL {side} @ {price_cents}c x{quantity} on {ticker} (status={status})")
+            self._log("TRADE", f"{exit_type} SELL {side} @ {price_cents}c x{quantity} on {ticker} (status={status})")
 
             if filled_count > 0:
                 record_trade(
@@ -538,17 +554,17 @@ class TradingBot:
                     order_id=order_id,
                     exit_type=exit_type,
                 )
-                log_event("TRADE", f"{exit_type} filled {filled_count}x {side} @ {price_cents}c on {ticker}")
+                self._log("TRADE", f"{exit_type} filled {filled_count}x {side} @ {price_cents}c on {ticker}")
             return order
         except httpx.HTTPStatusError as exc:
-            log_event("ERROR", f"{exit_type} order rejected: {exc.response.text[:200]}")
+            self._log("ERROR", f"{exit_type} order rejected: {exc.response.text[:200]}")
             return None
 
     def _paper_close_position(self, ticker: str, side: str, price_cents: int, quantity: int, exit_type: str = "SELL") -> dict | None:
         """Simulate selling a position against the live orderbook depth."""
         pos = self._paper_positions.get(ticker)
         if not pos or pos["quantity"] <= 0:
-            log_event("SIM", f"[PAPER] No position to close for {ticker}")
+            self._log("SIM", f"[PAPER] No position to close for {ticker}")
             return None
 
         want_qty = min(quantity, pos["quantity"])
@@ -557,7 +573,7 @@ class TradingBot:
         if ob:
             filled_qty, avg_price, fills = self._simulate_fill(ob, "sell", side, price_cents, want_qty)
             if filled_qty == 0:
-                log_event("SIM", f"[PAPER] No liquidity for {exit_type} {side.upper()} @ {price_cents}c on {ticker}")
+                self._log("SIM", f"[PAPER] No liquidity for {exit_type} {side.upper()} @ {price_cents}c on {ticker}")
                 return None
         else:
             # No orderbook available — fall back to limit price (graceful degradation)
@@ -589,7 +605,7 @@ class TradingBot:
             order_id=order_id,
             exit_type=exit_type,
         )
-        log_event("SIM", f"[PAPER] {exit_type} {filled_qty}x {side.upper()} @ {avg_price}c on {ticker}{partial_str}{slip_str} (proceeds ${proceeds_dollars:.2f}, bal ${self._paper_balance:.2f})")
+        self._log("SIM", f"[PAPER] {exit_type} {filled_qty}x {side.upper()} @ {avg_price}c on {ticker}{partial_str}{slip_str} (proceeds ${proceeds_dollars:.2f}, bal ${self._paper_balance:.2f})")
         self._save_paper_state()
 
         return {"order_id": order_id, "status": "filled" if remaining == 0 else "partial", "filled_count": filled_qty, "remaining_count": remaining}
@@ -614,7 +630,7 @@ class TradingBot:
         try:
             await self._do_settle(expired_tickers)
         except Exception as exc:
-            log_event("ERROR", f"[PAPER] Background settlement failed: {exc}")
+            self._log("ERROR", f"[PAPER] Background settlement failed: {exc}")
 
     async def _do_settle(self, expired_tickers: list[str]):
         """Inner settlement logic (separated for error handling)."""
@@ -639,7 +655,7 @@ class TradingBot:
                     if result:
                         break
                 except Exception as exc:
-                    log_event("ERROR", f"[PAPER] Could not fetch result for {ticker} (attempt {attempt+1}): {exc}")
+                    self._log("ERROR", f"[PAPER] Could not fetch result for {ticker} (attempt {attempt+1}): {exc}")
                 if attempt < 6:
                     await asyncio.sleep(15)
 
@@ -653,13 +669,13 @@ class TradingBot:
                         yes_wins = self.alpha.projected_settlement >= strike
                         if (yes_wins and side == "yes") or (not yes_wins and side == "no"):
                             settle_price = 100
-                        log_event("SIM", f"[PAPER] Using projected settlement ${self.alpha.projected_settlement:.2f} vs strike ${strike:.2f} → {'YES' if yes_wins else 'NO'}")
+                        self._log("SIM", f"[PAPER] Using projected settlement ${self.alpha.projected_settlement:.2f} vs strike ${strike:.2f} → {'YES' if yes_wins else 'NO'}")
                     else:
-                        log_event("SIM", f"[PAPER] Market {ticker} result unknown, no strike — settling at 0")
+                        self._log("SIM", f"[PAPER] Market {ticker} result unknown, no strike — settling at 0")
                 else:
-                    log_event("SIM", f"[PAPER] Market {ticker} result unknown, no projection — settling at 0")
+                    self._log("SIM", f"[PAPER] Market {ticker} result unknown, no projection — settling at 0")
 
-            log_event("SIM", f"[PAPER] Market {ticker} result: {result.upper() if result else 'PROJECTED'}")
+            self._log("SIM", f"[PAPER] Market {ticker} result: {result.upper() if result else 'PROJECTED'}")
 
             # Credit payout to paper balance
             payout_cents = settle_price * qty
@@ -667,7 +683,7 @@ class TradingBot:
 
             pnl_cents = payout_cents - exposure_cents
             outcome = "WON" if pnl_cents > 0 else "LOST" if pnl_cents < 0 else "BREAK-EVEN"
-            log_event("SIM", f"[PAPER] SETTLED {ticker}: {qty}x {side.upper()} → {outcome} (payout ${payout_cents/100:.2f}, cost ${exposure_cents/100:.2f}, P&L ${pnl_cents/100:+.2f})")
+            self._log("SIM", f"[PAPER] SETTLED {ticker}: {qty}x {side.upper()} → {outcome} (payout ${payout_cents/100:.2f}, cost ${exposure_cents/100:.2f}, P&L ${pnl_cents/100:+.2f})")
 
             _settle_order_id = f"paper-settle-{int(time.time() * 1000)}"
             record_trade(
@@ -729,7 +745,7 @@ class TradingBot:
                     if result:
                         break
                 except Exception as exc:
-                    log_event("ERROR", f"[LIVE] Could not fetch result for {old_ticker} (attempt {attempt+1}): {exc}")
+                    self._log("ERROR", f"[LIVE] Could not fetch result for {old_ticker} (attempt {attempt+1}): {exc}")
                 if attempt < 6:
                     await asyncio.sleep(15)
 
@@ -747,7 +763,7 @@ class TradingBot:
             payout_cents = settle_price * qty
             pnl_cents = payout_cents - exposure_cents
             outcome = "WON" if pnl_cents > 0 else "LOST" if pnl_cents < 0 else "BREAK-EVEN"
-            log_event("TRADE", f"[LIVE] SETTLED {old_ticker}: {qty}x {side.upper()} → {outcome} (payout ${payout_cents/100:.2f}, cost ${exposure_cents/100:.2f}, P&L ${pnl_cents/100:+.2f})")
+            self._log("TRADE", f"[LIVE] SETTLED {old_ticker}: {qty}x {side.upper()} → {outcome} (payout ${payout_cents/100:.2f}, cost ${exposure_cents/100:.2f}, P&L ${pnl_cents/100:+.2f})")
 
             _settle_order_id = f"live-settle-{int(time.time() * 1000)}"
             record_trade(
@@ -780,7 +796,7 @@ class TradingBot:
             await self._reconcile_market(old_ticker)
 
         except Exception as exc:
-            log_event("ERROR", f"[LIVE] Settlement recording failed for {old_ticker}: {exc}")
+            self._log("ERROR", f"[LIVE] Settlement recording failed for {old_ticker}: {exc}")
 
     async def _reconcile_market(self, ticker: str):
         """Fetch actual fills from Kalshi and update live_market_pnl with accurate data."""
@@ -855,10 +871,53 @@ class TradingBot:
                 total_revenue_cents=total_revenue_cents,
                 fees_cents=total_fees_cents,
             )
-            log_event("INFO", f"[LIVE] Reconciled {ticker}: cost=${buy_cost_cents/100:.2f}, revenue=${total_revenue_cents/100:.2f}, fees=${total_fees_cents/100:.2f}, P&L=${pnl_cents/100:+.2f}")
+
+            # Add SETTLE record to trades table if there's a remaining position and result
+            if result and (remaining_yes > 0 or remaining_no > 0):
+                from zoneinfo import ZoneInfo
+                import re
+                # Parse settle time from ticker (e.g., KXBTC15M-26FEB031045-45)
+                settle_ts = datetime.now(timezone.utc).isoformat()
+                try:
+                    match = re.search(r"-(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})-", ticker)
+                    if match:
+                        yr, mon_str, day, hr, mn = match.groups()
+                        months = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+                                  "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+                        mon = months.get(mon_str, 1)
+                        year = 2000 + int(yr)
+                        et = ZoneInfo("America/New_York")
+                        settle_dt = datetime(year, mon, int(day), int(hr), int(mn), 0, tzinfo=et)
+                        settle_ts = settle_dt.isoformat()
+                except Exception:
+                    pass
+
+                # Check if SETTLE already exists for this market
+                with get_db() as conn:
+                    existing = conn.execute(
+                        "SELECT 1 FROM trades WHERE market_id = ? AND action = 'SETTLE' LIMIT 1",
+                        (ticker,)
+                    ).fetchone()
+                    if not existing:
+                        if remaining_yes > 0:
+                            settle_price = 1.0 if result == "yes" else 0.0
+                            conn.execute(
+                                "INSERT INTO trades (ts, market_id, side, action, price, quantity, order_id) "
+                                "VALUES (?, ?, 'yes', 'SETTLE', ?, ?, ?)",
+                                (settle_ts, ticker, settle_price, remaining_yes, f"auto-settle-{ticker}"),
+                            )
+                        if remaining_no > 0:
+                            settle_price = 1.0 if result == "no" else 0.0
+                            conn.execute(
+                                "INSERT INTO trades (ts, market_id, side, action, price, quantity, order_id) "
+                                "VALUES (?, ?, 'no', 'SETTLE', ?, ?, ?)",
+                                (settle_ts, ticker, settle_price, remaining_no, f"auto-settle-{ticker}"),
+                            )
+
+            self._log("INFO", f"[LIVE] Reconciled {ticker}: cost=${buy_cost_cents/100:.2f}, revenue=${total_revenue_cents/100:.2f}, fees=${total_fees_cents/100:.2f}, P&L=${pnl_cents/100:+.2f}")
 
         except Exception as exc:
-            log_event("ERROR", f"[LIVE] Auto-reconcile failed for {ticker}: {exc}")
+            self._log("ERROR", f"[LIVE] Auto-reconcile failed for {ticker}: {exc}")
 
     # ------------------------------------------------------------------
     # Safety layer ("reflexes")
@@ -867,8 +926,8 @@ class TradingBot:
     def _time_guard(self, market: dict) -> bool:
         """Return True if safe to trade (enough time left)."""
         secs = market.get("_seconds_to_close", 0)
-        if secs < config.MIN_SECONDS_TO_CLOSE:
-            log_event("GUARD", f"Time guard: {secs:.0f}s left — too close to expiry")
+        if secs < self.cfg.MIN_SECONDS_TO_CLOSE:
+            self._log("GUARD", f"Time guard: {secs:.0f}s left — too close to expiry")
             return False
         return True
 
@@ -883,7 +942,7 @@ class TradingBot:
         no_orders = orderbook.get("no", []) if isinstance(orderbook.get("no"), list) else []
 
         if not yes_orders and not no_orders:
-            log_event("GUARD", "Spread guard: empty orderbook")
+            self._log("GUARD", "Spread guard: empty orderbook")
             return False, 0, 100
 
         # Use max() — Kalshi may return levels in any order
@@ -893,26 +952,28 @@ class TradingBot:
         # Two-sided market: enforce max spread
         if yes_orders and no_orders:
             spread = best_ask - best_bid
-            if spread > config.MAX_SPREAD_CENTS:
-                log_event("GUARD", f"Spread guard: {spread}c spread too wide")
+            if spread > self.cfg.MAX_SPREAD_CENTS:
+                self._log("GUARD", f"Spread guard: {spread}c spread too wide")
                 return False, best_bid, best_ask
 
         # One-sided market: allow trading (bot will place a limit order)
         return True, best_bid, best_ask
 
     def _extract_strike(self, market: dict) -> float | None:
-        """Extract the strike / reference price from a KXBTC15M market.
+        """Extract the strike / reference price from a market.
 
         Tries structured fields first (floor_strike / strike_price),
         then falls back to parsing dollar amounts from yes_sub_title or title.
+        Uses asset-specific threshold to determine if value is in dollars or cents.
         """
         strike = market.get("floor_strike") or market.get("strike_price")
+        strike_threshold = self._asset_config.get("strike_threshold", 1000)
         if strike:
             try:
                 val = float(strike)
-                # BTC strikes are already in dollars (e.g., 83873.08).
-                # Small values (<1000) might be cents from other market types.
-                return val if val > 1000 else val / 100.0
+                # Prices above threshold are in dollars, below might be cents
+                # BTC: >1000 = dollars, ETH: >100, SOL: >10
+                return val if val > strike_threshold else val / 100.0
             except (ValueError, TypeError):
                 pass
 
@@ -976,12 +1037,15 @@ class TradingBot:
                         new_price = no_ask
 
                 new_price = max(1, min(99, new_price))
-                log_event("SIM", f"[PAPER] Retry {attempt}/{max_retries}: {remaining}x {side.upper()} @ {new_price}c (was {price_cents}c)")
+                self._log("SIM", f"[PAPER] Retry {attempt}/{max_retries}: {remaining}x {side.upper()} @ {new_price}c (was {price_cents}c)")
                 retry_order = await self.place_order(ticker, side, new_price, remaining)
                 if retry_order:
                     filled = retry_order.get("filled_count", 0)
                     remaining = retry_order.get("remaining_count", remaining)
                     self.status["last_action"] = f"Retry {attempt} {side.upper()} @ {new_price}c x{filled} filled"
+                    # Track entry side on retry fill (prevents opposite-side orders)
+                    if filled > 0 and ticker not in self._entry_side:
+                        self._entry_side[ticker] = side
                     if remaining <= 0:
                         return  # Fully filled
                 else:
@@ -1000,7 +1064,7 @@ class TradingBot:
                 if status == "resting" and remaining > 0:
                     try:
                         await self._delete(f"/portfolio/orders/{current_order_id}")
-                        log_event("ALPHA", f"Cancelled unfilled order {current_order_id}, retry {attempt}/{max_retries}")
+                        self._log("ALPHA", f"Cancelled unfilled order {current_order_id}, retry {attempt}/{max_retries}")
                     except Exception:
                         pass
 
@@ -1033,15 +1097,19 @@ class TradingBot:
                     retry_order = await self.place_order(ticker, side, new_price, remaining)
                     if retry_order:
                         current_order_id = retry_order.get("order_id", current_order_id)
+                        filled = retry_order.get("filled_count", 0)
                         qty = remaining
                         self.status["last_action"] = f"Retry {attempt} {side.upper()} @ {new_price}c x{remaining}"
-                        log_event("ALPHA", f"Retry {attempt}/{max_retries}: {side} @ {new_price}c x{remaining} (was {price_cents}c)")
+                        self._log("ALPHA", f"Retry {attempt}/{max_retries}: {side} @ {new_price}c x{remaining} (was {price_cents}c)")
+                        # Track entry side on retry fill (prevents opposite-side orders)
+                        if filled > 0 and ticker not in self._entry_side:
+                            self._entry_side[ticker] = side
                     else:
                         return  # Order rejected
                 else:
                     return  # Filled or cancelled
             except Exception as exc:
-                log_event("ERROR", f"Fill-check error ({type(exc).__name__}): {exc!r}")
+                self._log("ERROR", f"Fill-check error ({type(exc).__name__}): {exc!r}")
                 return
 
     # ------------------------------------------------------------------
@@ -1051,20 +1119,20 @@ class TradingBot:
     async def run(self):
         self.running = True
         self.status["running"] = True
-        log_event("INFO", "Trading bot started")
+        self._log("INFO", f"Trading bot started ({self.mode} mode)")
 
         try:
             while self.running:
                 await self._cycle()
-                await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
+                await asyncio.sleep(self.cfg.POLL_INTERVAL_SECONDS)
         except asyncio.CancelledError:
-            log_event("INFO", "Trading bot cancelled")
+            self._log("INFO", f"Trading bot cancelled ({self.mode} mode)")
         finally:
             self.running = False
             self.status["running"] = False
             if self.http and not self.http.is_closed:
                 await self.http.aclose()
-            log_event("INFO", "Trading bot stopped")
+            self._log("INFO", f"Trading bot stopped ({self.mode} mode)")
 
     async def _cycle(self):
         self.status["cycle_count"] += 1
@@ -1083,7 +1151,7 @@ class TradingBot:
                 self.status["strike_price"] = None
                 self.status["close_time"] = None
                 self.status["market_title"] = None
-                log_event("INFO", "No active KXBTC15M market found")
+                self._log("INFO", f"No active {self._asset_config['market_series']} market found")
                 return
 
             ticker = market.get("ticker", "")
@@ -1099,13 +1167,14 @@ class TradingBot:
             if self.paper_mode and self._last_paper_ticker and self._last_paper_ticker != ticker:
                 old_ticker = self._last_paper_ticker
                 asyncio.create_task(self._settle_paper_positions(ticker))
-                log_event("INFO", f"Contract transition: {old_ticker} → {ticker} (settlement running in background)")
+                self._log("INFO", f"Contract transition: {old_ticker} → {ticker} (settlement running in background)")
                 # Clear tracking sets for new contract immediately
                 self._free_rolled.clear()
                 self._took_profit.clear()
                 self._edge_exit_ts.clear()
                 self._entry_ts.clear()
                 self._entry_edge.clear()
+                self._entry_side.clear()
                 self._edge_exits_count.clear()
                 if self.alpha:
                     self.alpha.reset_contract_window()
@@ -1125,6 +1194,7 @@ class TradingBot:
                     self._edge_exit_ts.clear()
                     self._entry_ts.clear()
                     self._entry_edge.clear()
+                    self._entry_side.clear()
                     self._edge_exits_count.clear()
                     if self.alpha:
                         self.alpha.reset_contract_window()
@@ -1153,7 +1223,7 @@ class TradingBot:
             if self._start_balance is None:
                 self._start_balance = balance
                 self._start_exposure = total_exposure
-                log_event("INFO", f"Starting balance: ${balance:.2f}, exposure: ${total_exposure:.2f}")
+                self._log("INFO", f"Starting balance: ${balance:.2f}, exposure: ${total_exposure:.2f}")
 
             # Settled P&L: (balance + exposure) - (start_balance + start_exposure)
             # Buying a contract moves money from balance→exposure (net zero).
@@ -1163,9 +1233,9 @@ class TradingBot:
             )
             # Daily loss circuit breaker (percentage of starting balance)
             # Uses realized P&L only — unrealized swings shouldn't trigger halt
-            max_daily_loss = self._start_balance * config.MAX_DAILY_LOSS_PCT / 100.0
+            max_daily_loss = self._start_balance * self.cfg.MAX_DAILY_LOSS_PCT / 100.0
             if settled_pnl < -max_daily_loss:
-                log_event("GUARD", f"Daily loss guard: ${settled_pnl:.2f} exceeds -{config.MAX_DAILY_LOSS_PCT:.1f}% (${max_daily_loss:.2f}) limit")
+                self._log("GUARD", f"Daily loss guard: ${settled_pnl:.2f} exceeds -{self.cfg.MAX_DAILY_LOSS_PCT:.1f}% (${max_daily_loss:.2f}) limit")
                 self.status["last_action"] = f"Daily loss limit hit (${settled_pnl:.2f})"
                 return
 
@@ -1210,7 +1280,7 @@ class TradingBot:
 
             # All-time P&L: paper uses fixed starting balance, live uses session start
             if self.paper_mode:
-                start_bal = config.PAPER_STARTING_BALANCE
+                start_bal = self.cfg.PAPER_STARTING_BALANCE
                 all_time_pnl = (balance + total_exposure) - start_bal
             else:
                 start_bal = self._start_balance + self._start_exposure
@@ -1251,23 +1321,23 @@ class TradingBot:
 
             # Guard states
             spread_val = best_ask - best_bid
-            max_exposure = balance * config.MAX_TOTAL_EXPOSURE_PCT / 100.0
+            max_exposure = balance * self.cfg.MAX_TOTAL_EXPOSURE_PCT / 100.0
             price_est = best_ask if best_ask < 100 else 50
-            position_budget = balance * config.MAX_POSITION_PCT / 100.0
+            position_budget = balance * self.cfg.MAX_POSITION_PCT / 100.0
             max_qty = max(1, int(position_budget / (price_est / 100.0))) if price_est > 0 else 1
             current_qty = abs(my_pos.get("position", 0) or 0) if my_pos else 0
             pos_val = (my_pos.get("position", 0) or 0) if my_pos else 0
 
             dashboard["guards"] = {
                 "time": {
-                    "blocked": secs_left < config.MIN_SECONDS_TO_CLOSE if secs_left else True,
+                    "blocked": secs_left < self.cfg.MIN_SECONDS_TO_CLOSE if secs_left else True,
                     "value": round(secs_left or 0, 0),
-                    "threshold": config.MIN_SECONDS_TO_CLOSE,
+                    "threshold": self.cfg.MIN_SECONDS_TO_CLOSE,
                 },
                 "spread": {
-                    "blocked": spread_val > config.MAX_SPREAD_CENTS,
+                    "blocked": spread_val > self.cfg.MAX_SPREAD_CENTS,
                     "value": spread_val,
-                    "threshold": config.MAX_SPREAD_CENTS,
+                    "threshold": self.cfg.MAX_SPREAD_CENTS,
                 },
                 "daily_loss": {
                     "blocked": settled_pnl < -max_daily_loss,
@@ -1275,22 +1345,22 @@ class TradingBot:
                     "threshold": round(-max_daily_loss, 2),
                 },
                 "hold_expiry": {
-                    "blocked": secs_left < config.HOLD_EXPIRY_SECS if secs_left else False,
+                    "blocked": secs_left < self.cfg.HOLD_EXPIRY_SECS if secs_left else False,
                     "value": round(secs_left or 0, 0),
-                    "threshold": config.HOLD_EXPIRY_SECS,
+                    "threshold": self.cfg.HOLD_EXPIRY_SECS,
                     "has_position": has_pos,
                 },
                 "price_min": {
-                    "blocked": best_ask < config.MIN_CONTRACT_PRICE and (100 - best_bid) < config.MIN_CONTRACT_PRICE,
+                    "blocked": best_ask < self.cfg.MIN_CONTRACT_PRICE and (100 - best_bid) < self.cfg.MIN_CONTRACT_PRICE,
                     "value_yes": best_ask,
                     "value_no": 100 - best_bid,
-                    "threshold": config.MIN_CONTRACT_PRICE,
+                    "threshold": self.cfg.MIN_CONTRACT_PRICE,
                 },
                 "price_max": {
-                    "blocked": best_ask > config.MAX_CONTRACT_PRICE and (100 - best_bid) > config.MAX_CONTRACT_PRICE,
+                    "blocked": best_ask > self.cfg.MAX_CONTRACT_PRICE and (100 - best_bid) > self.cfg.MAX_CONTRACT_PRICE,
                     "value_yes": best_ask,
                     "value_no": 100 - best_bid,
-                    "threshold": config.MAX_CONTRACT_PRICE,
+                    "threshold": self.cfg.MAX_CONTRACT_PRICE,
                 },
                 "exposure": {
                     "blocked": total_exposure >= max_exposure,
@@ -1310,9 +1380,9 @@ class TradingBot:
                     "blocked": ticker in self._took_profit if ticker else False,
                 },
                 "edge_reentry": {
-                    "blocked": ticker in self._edge_exit_ts and (time.time() - self._edge_exit_ts.get(ticker, 0)) < config.EDGE_EXIT_COOLDOWN_SECS if ticker else False,
-                    "cooldown_left": max(0, config.EDGE_EXIT_COOLDOWN_SECS - (time.time() - self._edge_exit_ts.get(ticker, 0))) if ticker and ticker in self._edge_exit_ts else 0,
-                    "premium": config.REENTRY_EDGE_PREMIUM,
+                    "blocked": ticker in self._edge_exit_ts and (time.time() - self._edge_exit_ts.get(ticker, 0)) < self.cfg.EDGE_EXIT_COOLDOWN_SECS if ticker else False,
+                    "cooldown_left": max(0, self.cfg.EDGE_EXIT_COOLDOWN_SECS - (time.time() - self._edge_exit_ts.get(ticker, 0))) if ticker and ticker in self._edge_exit_ts else 0,
+                    "premium": self.cfg.REENTRY_EDGE_PREMIUM,
                 },
             }
 
@@ -1328,26 +1398,26 @@ class TradingBot:
                 gain_p = ((sp - avg_c) / avg_c * 100) if avg_c > 0 else 0
 
                 exits["stop_loss"] = {
-                    "triggered": config.STOP_LOSS_CENTS > 0 and loss_p >= config.STOP_LOSS_CENTS,
+                    "triggered": self.cfg.STOP_LOSS_CENTS > 0 and loss_p >= self.cfg.STOP_LOSS_CENTS,
                     "value": round(loss_p, 1),
-                    "threshold": config.STOP_LOSS_CENTS,
+                    "threshold": self.cfg.STOP_LOSS_CENTS,
                 }
                 exits["hit_and_run"] = {
-                    "triggered": config.HIT_RUN_PCT > 0 and gain_p >= config.HIT_RUN_PCT,
+                    "triggered": self.cfg.HIT_RUN_PCT > 0 and gain_p >= self.cfg.HIT_RUN_PCT,
                     "value": round(gain_p, 1),
-                    "threshold": config.HIT_RUN_PCT,
-                    "enabled": config.HIT_RUN_PCT > 0,
+                    "threshold": self.cfg.HIT_RUN_PCT,
+                    "enabled": self.cfg.HIT_RUN_PCT > 0,
                 }
                 exits["profit_take"] = {
-                    "triggered": gain_p >= config.PROFIT_TAKE_PCT and secs_left > config.PROFIT_TAKE_MIN_SECS,
+                    "triggered": gain_p >= self.cfg.PROFIT_TAKE_PCT and secs_left > self.cfg.PROFIT_TAKE_MIN_SECS,
                     "value": round(gain_p, 1),
-                    "threshold": config.PROFIT_TAKE_PCT,
-                    "min_secs": config.PROFIT_TAKE_MIN_SECS,
+                    "threshold": self.cfg.PROFIT_TAKE_PCT,
+                    "min_secs": self.cfg.PROFIT_TAKE_MIN_SECS,
                 }
                 exits["free_roll"] = {
-                    "triggered": sp >= config.FREE_ROLL_PRICE and eq >= 2 and ticker not in self._free_rolled,
+                    "triggered": sp >= self.cfg.FREE_ROLL_PRICE and eq >= 2 and ticker not in self._free_rolled,
                     "value": sp,
-                    "threshold": config.FREE_ROLL_PRICE,
+                    "threshold": self.cfg.FREE_ROLL_PRICE,
                     "qty": eq,
                     "already_rolled": ticker in self._free_rolled,
                 }
@@ -1356,7 +1426,7 @@ class TradingBot:
                 _edge_remaining = 0
                 _edge_threshold = 0
                 _edge_hold = time.time() - self._entry_ts.get(ticker, time.time())
-                if config.EDGE_EXIT_ENABLED and self.alpha and strike and strike > 0:
+                if self.cfg.EDGE_EXIT_ENABLED and self.alpha and strike and strike > 0:
                     try:
                         _fv_edge = self.alpha.get_fair_value(strike, secs_left)
                         _fair_yes_edge = _fv_edge.get("fair_yes_cents", 0)
@@ -1365,38 +1435,42 @@ class TradingBot:
                         else:
                             _edge_remaining = best_ask - _fair_yes_edge
                         _tf = min(1.0, max(0.0, secs_left / 900.0))
-                        _edge_threshold = config.EDGE_EXIT_THRESHOLD_CENTS * _tf
+                        _edge_threshold = self.cfg.EDGE_EXIT_THRESHOLD_CENTS * _tf
                     except Exception:
                         pass
                 exits["edge_exit"] = {
-                    "triggered": config.EDGE_EXIT_ENABLED and _edge_remaining <= _edge_threshold and _edge_hold >= config.EDGE_EXIT_MIN_HOLD_SECS,
+                    "triggered": self.cfg.EDGE_EXIT_ENABLED and _edge_remaining <= _edge_threshold and _edge_hold >= self.cfg.EDGE_EXIT_MIN_HOLD_SECS,
                     "remaining_edge": round(_edge_remaining, 1),
                     "threshold": round(_edge_threshold, 1),
                     "hold_secs": round(_edge_hold, 0),
-                    "min_hold": config.EDGE_EXIT_MIN_HOLD_SECS,
-                    "enabled": config.EDGE_EXIT_ENABLED,
+                    "min_hold": self.cfg.EDGE_EXIT_MIN_HOLD_SECS,
+                    "enabled": self.cfg.EDGE_EXIT_ENABLED,
                     "count": self._edge_exits_count.get(ticker, 0),
                 }
             else:
-                exits["stop_loss"] = {"triggered": False, "value": 0, "threshold": config.STOP_LOSS_CENTS}
-                exits["hit_and_run"] = {"triggered": False, "value": 0, "threshold": config.HIT_RUN_PCT, "enabled": config.HIT_RUN_PCT > 0}
-                exits["profit_take"] = {"triggered": False, "value": 0, "threshold": config.PROFIT_TAKE_PCT, "min_secs": config.PROFIT_TAKE_MIN_SECS}
-                exits["free_roll"] = {"triggered": False, "value": 0, "threshold": config.FREE_ROLL_PRICE, "qty": 0, "already_rolled": False}
-                exits["edge_exit"] = {"triggered": False, "remaining_edge": 0, "threshold": 0, "hold_secs": 0, "min_hold": config.EDGE_EXIT_MIN_HOLD_SECS, "enabled": config.EDGE_EXIT_ENABLED, "count": self._edge_exits_count.get(ticker, 0) if ticker else 0}
+                exits["stop_loss"] = {"triggered": False, "value": 0, "threshold": self.cfg.STOP_LOSS_CENTS}
+                exits["hit_and_run"] = {"triggered": False, "value": 0, "threshold": self.cfg.HIT_RUN_PCT, "enabled": self.cfg.HIT_RUN_PCT > 0}
+                exits["profit_take"] = {"triggered": False, "value": 0, "threshold": self.cfg.PROFIT_TAKE_PCT, "min_secs": self.cfg.PROFIT_TAKE_MIN_SECS}
+                exits["free_roll"] = {"triggered": False, "value": 0, "threshold": self.cfg.FREE_ROLL_PRICE, "qty": 0, "already_rolled": False}
+                exits["edge_exit"] = {"triggered": False, "remaining_edge": 0, "threshold": 0, "hold_secs": 0, "min_hold": self.cfg.EDGE_EXIT_MIN_HOLD_SECS, "enabled": self.cfg.EDGE_EXIT_ENABLED, "count": self._edge_exits_count.get(ticker, 0) if ticker else 0}
             dashboard["exits"] = exits
 
             # Config thresholds for frontend display
-            dashboard["lead_lag_enabled"] = config.LEAD_LAG_ENABLED
-            dashboard["lead_lag_threshold"] = config.LEAD_LAG_THRESHOLD
-            dashboard["delta_threshold"] = config.DELTA_THRESHOLD
-            dashboard["extreme_delta_threshold"] = config.EXTREME_DELTA_THRESHOLD
-            dashboard["anchor_seconds_threshold"] = config.ANCHOR_SECONDS_THRESHOLD
-            dashboard["min_edge_cents"] = config.MIN_EDGE_CENTS
-            dashboard["min_confidence"] = config.RULE_MIN_CONFIDENCE
-            dashboard["edge_exit_enabled"] = config.EDGE_EXIT_ENABLED
-            dashboard["edge_exit_threshold"] = config.EDGE_EXIT_THRESHOLD_CENTS
-            dashboard["edge_exit_cooldown"] = config.EDGE_EXIT_COOLDOWN_SECS
-            dashboard["reentry_edge_premium"] = config.REENTRY_EDGE_PREMIUM
+            dashboard["lead_lag_enabled"] = self.cfg.LEAD_LAG_ENABLED
+            dashboard["lead_lag_threshold"] = self.cfg.LEAD_LAG_THRESHOLD
+            dashboard["delta_threshold"] = self.cfg.DELTA_THRESHOLD
+            dashboard["extreme_delta_threshold"] = self.cfg.EXTREME_DELTA_THRESHOLD
+            dashboard["anchor_seconds_threshold"] = self.cfg.ANCHOR_SECONDS_THRESHOLD
+            dashboard["min_edge_cents"] = self.cfg.MIN_EDGE_CENTS
+            dashboard["min_confidence"] = self.cfg.RULE_MIN_CONFIDENCE
+            dashboard["edge_exit_enabled"] = self.cfg.EDGE_EXIT_ENABLED
+            dashboard["edge_exit_threshold"] = self.cfg.EDGE_EXIT_THRESHOLD_CENTS
+            dashboard["edge_exit_cooldown"] = self.cfg.EDGE_EXIT_COOLDOWN_SECS
+            dashboard["reentry_edge_premium"] = self.cfg.REENTRY_EDGE_PREMIUM
+
+            # Rolling average confidence for threshold calibration
+            dashboard["rolling_avg_confidence"] = self.get_rolling_avg_confidence()
+            dashboard["confidence_sample_count"] = len(self._confidence_history)
 
             self.status["dashboard"] = dashboard
 
@@ -1437,24 +1511,24 @@ class TradingBot:
                 pos_exposure_cents = my_pos.get("market_exposure", 0) or 0
                 mark_to_market_exit = best_bid * pos_qty if pos_qty > 0 else (100 - best_ask) * abs(pos_qty) if pos_qty < 0 else 0
 
-                if abs(pos_qty) > 0 and config.TRADING_ENABLED:
+                if abs(pos_qty) > 0 and self.cfg.TRADING_ENABLED:
                     sell_side = "yes" if pos_qty > 0 else "no"
                     sell_price = best_bid if pos_qty > 0 else (100 - best_ask)
                     sell_price = max(1, min(99, sell_price))
                     current_value = sell_price
 
                     # Rule: Last-Minute Hold — don't sell in final stretch, ride to settlement
-                    if secs_left < config.HOLD_EXPIRY_SECS:
-                        log_event("GUARD", f"Hold-to-expiry: {secs_left:.0f}s left — riding to settlement")
+                    if secs_left < self.cfg.HOLD_EXPIRY_SECS:
+                        self._log("GUARD", f"Hold-to-expiry: {secs_left:.0f}s left — riding to settlement")
                         self.status["last_action"] = f"Holding to expiry ({secs_left:.0f}s left)"
                         return
 
                     # Rule: Stop-loss (still active outside hold zone)
-                    if config.STOP_LOSS_CENTS > 0:
+                    if self.cfg.STOP_LOSS_CENTS > 0:
                         loss_per_contract = (pos_exposure_cents - mark_to_market_exit) / abs(pos_qty)
-                        if loss_per_contract >= config.STOP_LOSS_CENTS:
+                        if loss_per_contract >= self.cfg.STOP_LOSS_CENTS:
                             sell_qty = abs(pos_qty)
-                            log_event("GUARD", f"Stop-loss triggered: down {loss_per_contract:.0f}c/contract (limit {config.STOP_LOSS_CENTS}c)")
+                            self._log("GUARD", f"Stop-loss triggered: down {loss_per_contract:.0f}c/contract (limit {self.cfg.STOP_LOSS_CENTS}c)")
                             order = await self.close_position(ticker, sell_side, sell_price, sell_qty, exit_type="SL")
                             if order:
                                 self.status["last_action"] = f"SL: sold {sell_qty}x {sell_side.upper()} @ {sell_price}c"
@@ -1481,7 +1555,7 @@ class TradingBot:
                             return
 
                     # Rule: Edge-exit — exit when remaining edge evaporates (time-scaled)
-                    if config.EDGE_EXIT_ENABLED and self.alpha and strike and strike > 0:
+                    if self.cfg.EDGE_EXIT_ENABLED and self.alpha and strike and strike > 0:
                         try:
                             fv = self.alpha.get_fair_value(strike, secs_left)
                             fair_yes = fv.get("fair_yes_cents", 0)
@@ -1491,13 +1565,13 @@ class TradingBot:
                                 remaining_edge = best_ask - fair_yes
 
                             time_factor = min(1.0, max(0.0, secs_left / 900.0))
-                            edge_threshold = config.EDGE_EXIT_THRESHOLD_CENTS * time_factor
+                            edge_threshold = self.cfg.EDGE_EXIT_THRESHOLD_CENTS * time_factor
                             hold_elapsed = time.time() - self._entry_ts.get(ticker, 0)
 
                             if (remaining_edge <= edge_threshold
-                                    and hold_elapsed >= config.EDGE_EXIT_MIN_HOLD_SECS):
+                                    and hold_elapsed >= self.cfg.EDGE_EXIT_MIN_HOLD_SECS):
                                 sell_qty = abs(pos_qty)
-                                log_event("TRADE", f"Edge-exit: remaining edge {remaining_edge:.1f}c <= threshold {edge_threshold:.1f}c (held {hold_elapsed:.0f}s)")
+                                self._log("TRADE", f"Edge-exit: remaining edge {remaining_edge:.1f}c <= threshold {edge_threshold:.1f}c (held {hold_elapsed:.0f}s)")
                                 order = await self.close_position(ticker, sell_side, sell_price, sell_qty, exit_type="EDGE")
                                 if order:
                                     self.status["last_action"] = f"EDGE EXIT: sold {sell_qty}x {sell_side.upper()} @ {sell_price}c (edge {remaining_edge:.1f}c)"
@@ -1506,6 +1580,7 @@ class TradingBot:
                                     # Clear entry tracking (position is closed)
                                     self._entry_ts.pop(ticker, None)
                                     self._entry_edge.pop(ticker, None)
+                                    self._entry_side.pop(ticker, None)
                                     try:
                                         _mid = f"[PAPER] {ticker}" if self.paper_mode else ticker
                                         _entry = get_entry_snapshot(_mid)
@@ -1537,9 +1612,9 @@ class TradingBot:
                     gain_pct = ((current_value - avg_cost) / avg_cost * 100) if avg_cost > 0 else 0
 
                     # Rule: Hit-and-Run — instant exit at % profit (NO time restrictions)
-                    if config.HIT_RUN_PCT > 0 and gain_pct >= config.HIT_RUN_PCT:
+                    if self.cfg.HIT_RUN_PCT > 0 and gain_pct >= self.cfg.HIT_RUN_PCT:
                         sell_qty = abs(pos_qty)
-                        log_event("TRADE", f"Hit-and-run: +{gain_pct:.0f}% gain ({current_value}c vs {avg_cost:.0f}c cost) >= {config.HIT_RUN_PCT}% target — instant exit")
+                        self._log("TRADE", f"Hit-and-run: +{gain_pct:.0f}% gain ({current_value}c vs {avg_cost:.0f}c cost) >= {self.cfg.HIT_RUN_PCT}% target — instant exit")
                         order = await self.close_position(ticker, sell_side, sell_price, sell_qty, exit_type="TP")
                         if order:
                             self.status["last_action"] = f"HIT&RUN: sold {sell_qty}x {sell_side.upper()} @ {sell_price}c (+{gain_pct:.0f}%)"
@@ -1568,9 +1643,9 @@ class TradingBot:
                         return
 
                     # Rule: Pop-and-Drop — full exit at % profit with time remaining
-                    if gain_pct >= config.PROFIT_TAKE_PCT and secs_left > config.PROFIT_TAKE_MIN_SECS:
+                    if gain_pct >= self.cfg.PROFIT_TAKE_PCT and secs_left > self.cfg.PROFIT_TAKE_MIN_SECS:
                         sell_qty = abs(pos_qty)
-                        log_event("TRADE", f"Profit take: +{gain_pct:.0f}% gain ({current_value}c vs {avg_cost:.0f}c cost) >= {config.PROFIT_TAKE_PCT}% target, {secs_left:.0f}s left — selling all")
+                        self._log("TRADE", f"Profit take: +{gain_pct:.0f}% gain ({current_value}c vs {avg_cost:.0f}c cost) >= {self.cfg.PROFIT_TAKE_PCT}% target, {secs_left:.0f}s left — selling all")
                         order = await self.close_position(ticker, sell_side, sell_price, sell_qty, exit_type="TP")
                         if order:
                             self.status["last_action"] = f"TP: sold {sell_qty}x {sell_side.upper()} @ {sell_price}c (+{gain_pct:.0f}%)"
@@ -1599,11 +1674,11 @@ class TradingBot:
                         return
 
                     # Rule: Free Roll — sell half at intermediate profit to lock in capital
-                    if (current_value >= config.FREE_ROLL_PRICE
+                    if (current_value >= self.cfg.FREE_ROLL_PRICE
                             and ticker not in self._free_rolled
                             and abs(pos_qty) >= 2):
                         half_qty = max(1, abs(pos_qty) // 2)
-                        log_event("TRADE", f"Free roll: {current_value}c >= {config.FREE_ROLL_PRICE}c — selling {half_qty}/{abs(pos_qty)} to lock in capital")
+                        self._log("TRADE", f"Free roll: {current_value}c >= {self.cfg.FREE_ROLL_PRICE}c — selling {half_qty}/{abs(pos_qty)} to lock in capital")
                         order = await self.close_position(ticker, sell_side, sell_price, half_qty)
                         if order:
                             self._free_rolled.add(ticker)
@@ -1687,41 +1762,41 @@ class TradingBot:
                 # contracts haven't repriced yet (the "60-second lag" play).
                 # Only overrides if actual edge exists (Kalshi hasn't caught up).
                 strike = self._extract_strike(market)
-                if config.LEAD_LAG_ENABLED and strike and strike > 0:
+                if self.cfg.LEAD_LAG_ENABLED and strike and strike > 0:
                     signal, diff = self.alpha.get_signal(strike)
                     self.status["alpha_signal"] = signal
                     self.status["alpha_signal_diff"] = diff
                     yes_edge = dashboard.get("yes_edge", 0)
                     no_edge = dashboard.get("no_edge", 0)
-                    min_edge = config.MIN_EDGE_CENTS
+                    min_edge = self.cfg.MIN_EDGE_CENTS
                     if signal == "BULLISH" and yes_edge >= min_edge:
                         alpha_override = "BUY_YES"
                         _trigger_type = "lead_lag"
-                        log_event("ALPHA", f"Lead-lag BUY_YES: global ${self.alpha.get_weighted_global_price():.2f} > strike ${strike:.2f} by ${diff:.2f} (edge {yes_edge}c)")
+                        self._log("ALPHA", f"Lead-lag BUY_YES: global ${self.alpha.get_weighted_global_price():.2f} > strike ${strike:.2f} by ${diff:.2f} (edge {yes_edge}c)")
                     elif signal == "BEARISH" and no_edge >= min_edge:
                         alpha_override = "BUY_NO"
                         _trigger_type = "lead_lag"
-                        log_event("ALPHA", f"Lead-lag BUY_NO: global ${self.alpha.get_weighted_global_price():.2f} < strike ${strike:.2f} by ${abs(diff):.2f} (edge {no_edge}c)")
+                        self._log("ALPHA", f"Lead-lag BUY_NO: global ${self.alpha.get_weighted_global_price():.2f} < strike ${strike:.2f} by ${abs(diff):.2f} (edge {no_edge}c)")
                     elif signal != "NEUTRAL":
-                        log_event("ALPHA", f"Lead-lag {signal} but no edge (YES:{yes_edge}c NO:{no_edge}c < {min_edge}c) — deferring to rules")
+                        self._log("ALPHA", f"Lead-lag {signal} but no edge (YES:{yes_edge}c NO:{no_edge}c < {min_edge}c) — deferring to rules")
 
                 # Override 1: Front-Run (delta momentum — deviation from rolling baseline)
                 # Only fires if lead-lag didn't already trigger, and only with edge
                 if not alpha_override:
                     yes_edge = dashboard.get("yes_edge", 0)
                     no_edge = dashboard.get("no_edge", 0)
-                    min_edge = config.MIN_EDGE_CENTS
-                    if momentum > config.DELTA_THRESHOLD and yes_edge >= min_edge:
+                    min_edge = self.cfg.MIN_EDGE_CENTS
+                    if momentum > self.cfg.DELTA_THRESHOLD and yes_edge >= min_edge:
                         alpha_override = "BUY_YES"
                         _trigger_type = "momentum"
-                        log_event("ALPHA", f"Front-run BUY_YES: momentum={momentum:+.2f} > {config.DELTA_THRESHOLD} (edge {yes_edge}c)")
-                    elif momentum < -config.DELTA_THRESHOLD and no_edge >= min_edge:
+                        self._log("ALPHA", f"Front-run BUY_YES: momentum={momentum:+.2f} > {self.cfg.DELTA_THRESHOLD} (edge {yes_edge}c)")
+                    elif momentum < -self.cfg.DELTA_THRESHOLD and no_edge >= min_edge:
                         alpha_override = "BUY_NO"
                         _trigger_type = "momentum"
-                        log_event("ALPHA", f"Front-run BUY_NO: momentum={momentum:+.2f} < -{config.DELTA_THRESHOLD} (edge {no_edge}c)")
+                        self._log("ALPHA", f"Front-run BUY_NO: momentum={momentum:+.2f} < -{self.cfg.DELTA_THRESHOLD} (edge {no_edge}c)")
 
                 # Override 2: Anchor Defense (near expiry + holding position)
-                if secs_left < config.ANCHOR_SECONDS_THRESHOLD and my_pos:
+                if secs_left < self.cfg.ANCHOR_SECONDS_THRESHOLD and my_pos:
                     if strike and strike > 0:
                         projection_wins = self.alpha.get_settlement_projection(strike, secs_left)
                         pos_val = my_pos.get("position", 0) or 0
@@ -1730,11 +1805,11 @@ class TradingBot:
                         if yes_qty and not projection_wins:
                             alpha_override = "BUY_NO"
                             _trigger_type = "anchor"
-                            log_event("ALPHA", f"Anchor defense: proj {self.alpha.projected_settlement:.2f} < strike {strike}, forcing BUY_NO")
+                            self._log("ALPHA", f"Anchor defense: proj {self.alpha.projected_settlement:.2f} < strike {strike}, forcing BUY_NO")
                         elif no_qty and projection_wins:
                             alpha_override = "BUY_YES"
                             _trigger_type = "anchor"
-                            log_event("ALPHA", f"Anchor defense: proj {self.alpha.projected_settlement:.2f} >= strike {strike}, forcing BUY_YES")
+                            self._log("ALPHA", f"Anchor defense: proj {self.alpha.projected_settlement:.2f} >= strike {strike}, forcing BUY_YES")
             else:
                 # Update connection status even when disconnected
                 if self.alpha:
@@ -1743,7 +1818,7 @@ class TradingBot:
 
             self.status["alpha_override"] = alpha_override
 
-            if not config.TRADING_ENABLED:
+            if not self.cfg.TRADING_ENABLED:
                 self.status["last_action"] = "Trading disabled — dry run"
                 if alpha_override:
                     decision = {"decision": alpha_override, "confidence": 1.0,
@@ -1751,6 +1826,7 @@ class TradingBot:
                 else:
                     decision = self.agent.analyze_market(market_data, my_pos, alpha_monitor=self.alpha)
                 self.status["last_decision"] = decision
+                self._track_confidence(decision.get("confidence", 0))
                 return
 
             # 7. Alpha override or rule-based decision
@@ -1767,11 +1843,12 @@ class TradingBot:
             else:
                 decision = self.agent.analyze_market(market_data, my_pos, alpha_monitor=self.alpha)
                 self.status["last_decision"] = decision
+                self._track_confidence(decision.get("confidence", 0))
 
                 action = decision["decision"]
                 confidence = decision["confidence"]
 
-                if action == "HOLD" or confidence < config.RULE_MIN_CONFIDENCE:
+                if action == "HOLD" or confidence < self.cfg.RULE_MIN_CONFIDENCE:
                     self.status["last_action"] = f"Rules: {action} ({confidence:.0%})"
                     return
 
@@ -1787,29 +1864,38 @@ class TradingBot:
                 holding_no = pos_val < 0
                 if (holding_yes and side == "no") or (holding_no and side == "yes"):
                     held_side = "YES" if holding_yes else "NO"
-                    log_event("GUARD", f"Same-side guard: holding {held_side}, blocked {side.upper()} order")
+                    self._log("GUARD", f"Same-side guard: holding {held_side}, blocked {side.upper()} order")
                     self.status["last_action"] = f"Blocked — already holding {held_side}"
+                    return
+
+            # Entry-side guard: block opposite-side orders when we have a confirmed fill
+            # This catches cases where position API is stale but we know we filled
+            if ticker in self._entry_side:
+                entered_side = self._entry_side[ticker]
+                if entered_side != side:
+                    self._log("GUARD", f"Entry guard: already filled {entered_side.upper()}, blocked {side.upper()} order")
+                    self.status["last_action"] = f"Blocked — already entered {entered_side.upper()}"
                     return
 
             # Take-profit guard: never re-enter a contract after we've taken profit
             if ticker in self._took_profit:
-                log_event("GUARD", f"TP guard: already took profit on {ticker} — no re-entry")
+                self._log("GUARD", f"TP guard: already took profit on {ticker} — no re-entry")
                 self.status["last_action"] = "Already took profit — no re-entry"
                 return
 
             # Edge-exit re-entry guard: cooldown + premium edge required
             if ticker in self._edge_exit_ts:
                 cooldown_elapsed = time.time() - self._edge_exit_ts[ticker]
-                if cooldown_elapsed < config.EDGE_EXIT_COOLDOWN_SECS:
-                    remaining_cd = config.EDGE_EXIT_COOLDOWN_SECS - cooldown_elapsed
-                    log_event("GUARD", f"Edge re-entry cooldown: {remaining_cd:.0f}s remaining")
+                if cooldown_elapsed < self.cfg.EDGE_EXIT_COOLDOWN_SECS:
+                    remaining_cd = self.cfg.EDGE_EXIT_COOLDOWN_SECS - cooldown_elapsed
+                    self._log("GUARD", f"Edge re-entry cooldown: {remaining_cd:.0f}s remaining")
                     self.status["last_action"] = f"Edge re-entry cooldown ({remaining_cd:.0f}s left)"
                     return
                 # After cooldown, require extra edge premium for re-entry
                 entry_side_edge = dashboard.get("yes_edge", 0) if side == "yes" else dashboard.get("no_edge", 0)
-                required_edge = config.MIN_EDGE_CENTS + config.REENTRY_EDGE_PREMIUM
+                required_edge = self.cfg.MIN_EDGE_CENTS + self.cfg.REENTRY_EDGE_PREMIUM
                 if entry_side_edge < required_edge:
-                    log_event("GUARD", f"Edge re-entry premium: edge {entry_side_edge}c < required {required_edge}c (MIN_EDGE {config.MIN_EDGE_CENTS} + premium {config.REENTRY_EDGE_PREMIUM})")
+                    self._log("GUARD", f"Edge re-entry premium: edge {entry_side_edge}c < required {required_edge}c (MIN_EDGE {self.cfg.MIN_EDGE_CENTS} + premium {self.cfg.REENTRY_EDGE_PREMIUM})")
                     self.status["last_action"] = f"Insufficient edge for re-entry ({entry_side_edge}c < {required_edge}c)"
                     return
 
@@ -1819,16 +1905,16 @@ class TradingBot:
             # - Rule-based: midpoint of spread (balanced fill vs. price improvement)
             extreme_momentum = (
                 self.alpha
-                and abs(self.alpha.delta_momentum) > config.EXTREME_DELTA_THRESHOLD
+                and abs(self.alpha.delta_momentum) > self.cfg.EXTREME_DELTA_THRESHOLD
             )
             if extreme_momentum and best_ask < 100 and best_bid > 0:
                 # Cross the spread — hit the ask (YES) or bid (NO)
                 price_cents = best_ask if side == "yes" else (100 - best_bid)
-                log_event("ALPHA", f"Extreme momentum ({self.alpha.delta_momentum:+.2f}) — crossing spread at {price_cents}c")
+                self._log("ALPHA", f"Extreme momentum ({self.alpha.delta_momentum:+.2f}) — crossing spread at {price_cents}c")
             elif alpha_override and best_ask < 100 and best_bid > 0:
                 # Alpha signals are time-sensitive — cross the spread to ensure fill
                 price_cents = best_ask if side == "yes" else (100 - best_bid)
-                log_event("ALPHA", f"Alpha override — crossing spread at {price_cents}c")
+                self._log("ALPHA", f"Alpha override — crossing spread at {price_cents}c")
             elif best_ask < 100 and best_bid > 0:
                 if self.paper_mode:
                     # Paper mode: cross spread to get realistic fills (paper can't simulate resting orders)
@@ -1849,28 +1935,28 @@ class TradingBot:
 
             # Respect price guards (avoid lottery tickets AND terrible risk/reward)
             effective_price = price_cents if side == "yes" else (100 - price_cents)
-            if effective_price < config.MIN_CONTRACT_PRICE:
-                log_event("GUARD", f"Price guard: {effective_price}c < {config.MIN_CONTRACT_PRICE}c min")
+            if effective_price < self.cfg.MIN_CONTRACT_PRICE:
+                self._log("GUARD", f"Price guard: {effective_price}c < {self.cfg.MIN_CONTRACT_PRICE}c min")
                 self.status["last_action"] = "Price too cheap — holding"
                 return
-            if effective_price > config.MAX_CONTRACT_PRICE:
-                log_event("GUARD", f"Price guard: {effective_price}c > {config.MAX_CONTRACT_PRICE}c max — bad risk/reward")
+            if effective_price > self.cfg.MAX_CONTRACT_PRICE:
+                self._log("GUARD", f"Price guard: {effective_price}c > {self.cfg.MAX_CONTRACT_PRICE}c max — bad risk/reward")
                 self.status["last_action"] = f"Price too expensive ({effective_price}c) — holding"
                 return
 
             # Portfolio-wide exposure guard (percentage of current balance)
-            max_exposure = balance * config.MAX_TOTAL_EXPOSURE_PCT / 100.0
+            max_exposure = balance * self.cfg.MAX_TOTAL_EXPOSURE_PCT / 100.0
             if total_exposure >= max_exposure:
-                log_event("GUARD", f"Exposure guard: ${total_exposure:.2f} >= {config.MAX_TOTAL_EXPOSURE_PCT:.1f}% (${max_exposure:.2f}) limit")
+                self._log("GUARD", f"Exposure guard: ${total_exposure:.2f} >= {self.cfg.MAX_TOTAL_EXPOSURE_PCT:.1f}% (${max_exposure:.2f}) limit")
                 self.status["last_action"] = f"Max exposure reached (${total_exposure:.2f})"
                 return
 
             # Dynamic contract sizing from balance percentages
             # price_cents is the cost per contract we'd pay
-            position_budget = balance * config.MAX_POSITION_PCT / 100.0
+            position_budget = balance * self.cfg.MAX_POSITION_PCT / 100.0
             max_position = max(1, int(position_budget / (price_cents / 100.0))) if price_cents > 0 else 1
 
-            order_budget = balance * config.ORDER_SIZE_PCT / 100.0
+            order_budget = balance * self.cfg.ORDER_SIZE_PCT / 100.0
             order_size = max(1, int(order_budget / (price_cents / 100.0))) if price_cents > 0 else 1
 
             # Re-fetch positions after cancel (fills may have occurred since initial fetch)
@@ -1885,33 +1971,37 @@ class TradingBot:
                 current_qty = abs(my_pos.get("position", 0) or 0)
             remaining_capacity = max_position - current_qty
             if remaining_capacity <= 0:
-                log_event("GUARD", f"Position guard: {current_qty}/{max_position} contracts ({config.MAX_POSITION_PCT:.1f}% of balance)")
+                self._log("GUARD", f"Position guard: {current_qty}/{max_position} contracts ({self.cfg.MAX_POSITION_PCT:.1f}% of balance)")
                 self.status["last_action"] = f"Max position reached ({current_qty})"
                 return
 
             qty = min(order_size, remaining_capacity)
             order = await self.place_order(ticker, side, price_cents, qty)
             if order:
-                self.status["last_action"] = f"Placed {side.upper()} @ {price_cents}c x{qty}"
-                # Record entry time and edge for edge-exit logic
-                self._entry_ts[ticker] = time.time()
-                entry_edge = dashboard.get("yes_edge", 0) if side == "yes" else dashboard.get("no_edge", 0)
-                self._entry_edge[ticker] = entry_edge
-                try:
-                    _mid = f"[PAPER] {ticker}" if self.paper_mode else ticker
-                    record_snapshot({
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "trade_id": order.get("order_id", f"snap-{int(time.time()*1000)}"),
-                        "market_id": _mid, "action": "BUY", "side": side,
-                        "price_cents": price_cents,
-                        "quantity": order.get("filled_count", qty),
-                        "decision": action, "confidence": confidence,
-                        "trigger_type": _trigger_type,
-                        "position_qty": current_qty,
-                        **_snap_ctx,
-                    })
-                except Exception:
-                    pass
+                filled_count = order.get("filled_count", 0)
+                self.status["last_action"] = f"Placed {side.upper()} @ {price_cents}c x{qty}" + (f" ({filled_count} filled)" if filled_count > 0 else " (resting)")
+                # Only track entry if we actually filled — prevents opposite-side trades
+                # when position API is stale but we have a real fill
+                if filled_count > 0:
+                    self._entry_ts[ticker] = time.time()
+                    entry_edge = dashboard.get("yes_edge", 0) if side == "yes" else dashboard.get("no_edge", 0)
+                    self._entry_edge[ticker] = entry_edge
+                    self._entry_side[ticker] = side
+                    try:
+                        _mid = f"[PAPER] {ticker}" if self.paper_mode else ticker
+                        record_snapshot({
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "trade_id": order.get("order_id", f"snap-{int(time.time()*1000)}"),
+                            "market_id": _mid, "action": "BUY", "side": side,
+                            "price_cents": price_cents,
+                            "quantity": filled_count,
+                            "decision": action, "confidence": confidence,
+                            "trigger_type": _trigger_type,
+                            "position_qty": current_qty,
+                            **_snap_ctx,
+                        })
+                    except Exception:
+                        pass
                 # Fill-or-cancel: skip retries for spread-crossing orders (already at best price)
                 if not extreme_momentum and not alpha_override:
                     order_id = order.get("order_id")
@@ -1921,13 +2011,13 @@ class TradingBot:
                 self.status["last_action"] = "Order rejected"
 
         except httpx.HTTPStatusError as exc:
-            log_event("ERROR", f"HTTP {exc.response.status_code}: {exc.response.text[:200]}")
+            self._log("ERROR", f"HTTP {exc.response.status_code}: {exc.response.text[:200]}")
             self.status["last_action"] = f"API error {exc.response.status_code}"
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
-            log_event("ERROR", f"Cycle error ({type(exc).__name__}): {exc!r}")
-            log_event("ERROR", f"Traceback: {tb[-500:]}")
+            self._log("ERROR", f"Cycle error ({type(exc).__name__}): {exc!r}")
+            self._log("ERROR", f"Traceback: {tb[-500:]}")
             self.status["last_action"] = f"Error: {type(exc).__name__}: {exc}"
 
     def stop(self):

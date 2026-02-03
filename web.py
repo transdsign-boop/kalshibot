@@ -10,41 +10,101 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 import config
+from config import SUPPORTED_ASSETS
 
 # Simple TTL cache for REST orderbook fetches (avoids hammering Kalshi API)
 _ob_cache: dict = {"ticker": "", "data": None, "ts": 0.0}
 _OB_CACHE_TTL = 2.0  # seconds
-from config import get_tunables, set_tunables, restore_tunables, TUNABLE_FIELDS
+from config import get_tunables, set_tunables, restore_tunables, TUNABLE_FIELDS, BotConfig, migrate_to_dual_config, migrate_to_multi_asset, reset_asset_specific_defaults
 from database import init_db, get_recent_logs, get_latest_decision, get_todays_trades, get_trades_with_pnl, get_setting, set_setting, get_all_unsettled_live_entries, backfill_buy_trades_from_snapshots, get_db, set_live_market_pnl
 from alpha_engine import AlphaMonitor
 from trader import TradingBot
 
 FRONTEND_DIR = Path(__file__).parent / "frontend" / "dist"
 
-alpha_monitor = AlphaMonitor()
-bot = TradingBot(alpha_monitor=alpha_monitor)
-bot_task: asyncio.Task | None = None
+# --- Multi-Asset Bot Registry ---
+# Per-asset alpha monitors (one per asset — handles price feeds for that asset)
+alpha_monitors: dict[str, AlphaMonitor] = {}
+
+# Bot registry: (asset, mode) -> TradingBot
+# 3 assets × 2 modes = 6 bot instances
+bots: dict[tuple[str, str], TradingBot] = {}
+bot_configs: dict[tuple[str, str], BotConfig] = {}
+bot_tasks: dict[tuple[str, str], asyncio.Task] = {}
+
+
+def get_bot(asset: str = "btc", mode: str = "paper") -> TradingBot | None:
+    """Get the bot instance for the specified asset and mode."""
+    return bots.get((asset, mode))
+
+
+def get_alpha(asset: str = "btc") -> AlphaMonitor | None:
+    """Get the alpha monitor for the specified asset."""
+    return alpha_monitors.get(asset)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global alpha_monitors, bots, bot_configs, bot_tasks
+
     init_db()
     restore_tunables()
-    # Restore paper trading state (balance, positions) from DB
-    if bot.paper_mode:
-        bot._restore_paper_state()
-    await alpha_monitor.start()
-    # Auto-start bot if it was running before restart/deploy
-    if get_setting("bot_running") == "1":
-        global bot_task
-        bot_task = asyncio.create_task(bot.run())
+
+    # One-time migrations
+    migrate_to_dual_config()
+    migrate_to_multi_asset()
+
+    # Reset ETH/SOL configs to asset-specific defaults (fixes any BTC values that were incorrectly saved)
+    reset_asset_specific_defaults()
+
+    # Create per-asset alpha monitors
+    for asset in SUPPORTED_ASSETS:
+        alpha_monitors[asset] = AlphaMonitor(asset=asset)
+
+    # Create 6 bot instances: 3 assets × 2 modes
+    for asset in SUPPORTED_ASSETS:
+        for mode in ("paper", "live"):
+            key = (asset, mode)
+            bot_configs[key] = BotConfig.load(mode, asset)
+            bots[key] = TradingBot(
+                alpha_monitor=alpha_monitors[asset],
+                bot_config=bot_configs[key],
+                mode=mode,
+                asset=asset,
+            )
+            # Restore paper trading state (per-asset)
+            if mode == "paper":
+                bots[key]._restore_paper_state()
+
+    # Start all alpha engines
+    for asset, alpha in alpha_monitors.items():
+        await alpha.start()
+
+    # Auto-start bots if they were running before restart/deploy
+    for asset in SUPPORTED_ASSETS:
+        for mode in ("paper", "live"):
+            key = (asset, mode)
+            setting_key = f"{asset}_{mode}_bot_running"
+            # Also check old key format for BTC (migration)
+            if asset == "btc":
+                old_key = f"{mode}_bot_running"
+                if get_setting(setting_key) == "1" or get_setting(old_key) == "1":
+                    bot_tasks[key] = asyncio.create_task(bots[key].run())
+            elif get_setting(setting_key) == "1":
+                bot_tasks[key] = asyncio.create_task(bots[key].run())
+
     yield
-    # Shutdown: stop bot if running
-    if bot.running:
-        bot.stop()
-        if bot_task and not bot_task.done():
-            bot_task.cancel()
-    await alpha_monitor.stop()
+
+    # Shutdown: stop all bots and alpha monitors
+    for key, bot in bots.items():
+        if bot and bot.running:
+            bot.stop()
+            task = bot_tasks.get(key)
+            if task and not task.done():
+                task.cancel()
+
+    for alpha in alpha_monitors.values():
+        await alpha.stop()
 
 
 app = FastAPI(title="Kalshi BTC Auto-Trader", lifespan=lifespan)
@@ -55,11 +115,17 @@ app = FastAPI(title="Kalshi BTC Auto-Trader", lifespan=lifespan)
 # ------------------------------------------------------------------
 
 @app.get("/api/status")
-async def api_status():
-    decision = bot.status.get("last_decision") or get_latest_decision()
-    pos = bot.status.get("active_position")
+async def api_status(asset: str = "btc", bot: str = "paper"):
+    """Get status for specified asset and mode."""
+    target_bot = get_bot(asset, bot)
+    alpha = get_alpha(asset)
+    if not target_bot:
+        return {"error": f"Bot not initialized for {asset}/{bot}"}
+
+    decision = target_bot.status.get("last_decision") or get_latest_decision()
+    pos = target_bot.status.get("active_position")
     pos_label = "None"
-    ticker = bot.status.get("current_market") or ""
+    ticker = target_bot.status.get("current_market") or ""
 
     # Orderbook: REST API (2s cache) → WS → cycle cache
     # REST is primary because Kalshi WS orderbook_delta often stops sending updates
@@ -72,14 +138,14 @@ async def api_status():
             ob_source = "rest_cached"
         else:
             try:
-                live_ob = await bot.fetch_orderbook(ticker)
+                live_ob = await target_bot.fetch_orderbook(ticker)
                 _ob_cache["ticker"] = ticker
                 _ob_cache["data"] = live_ob
                 _ob_cache["ts"] = now
                 ob_source = "rest"
             except Exception:
                 # REST failed — try WS as fallback
-                live_ob = alpha_monitor.get_live_orderbook(ticker) if ticker else None
+                live_ob = alpha.get_live_orderbook(ticker) if alpha and ticker else None
                 if live_ob:
                     ob_source = "ws"
 
@@ -97,7 +163,7 @@ async def api_status():
             "source": ob_source,
         }
     else:
-        ob_snapshot = bot.status.get("orderbook") or {}
+        ob_snapshot = target_bot.status.get("orderbook") or {}
         ob_snapshot["source"] = ob_source
         best_bid = ob_snapshot.get("best_bid", 0)
         best_ask = ob_snapshot.get("best_ask", 100)
@@ -124,24 +190,27 @@ async def api_status():
                 position_pnl_pct = (position_pnl / (exposure / 100.0)) * 100.0
 
     # Total account value: use backend-computed value, but update position MTM with live data
-    balance_num = bot.status.get("balance", 0.0)
-    total_account = bot.status.get("total_account_value", balance_num)
+    balance_num = target_bot.status.get("balance", 0.0)
+    total_account = target_bot.status.get("total_account_value", balance_num)
     # If we have fresher MTM from live orderbook, adjust total_account
     if live_ob and pos:
-        cycle_mtm = bot.status.get("position_pnl", 0.0)  # from last cycle
+        cycle_mtm = target_bot.status.get("position_pnl", 0.0)  # from last cycle
         total_account = total_account - cycle_mtm + position_pnl
 
-    start_bal = bot.status.get("start_balance")
+    start_bal = target_bot.status.get("start_balance")
     if start_bal is None:
-        start_bal = config.PAPER_STARTING_BALANCE if bot.paper_mode else (bot._start_balance or 100.0)
+        start_bal = target_bot.cfg.PAPER_STARTING_BALANCE if target_bot.paper_mode else (target_bot._start_balance or 100.0)
 
-    day_pnl = bot.status.get("day_pnl", 0.0)
-    # Refresh day_pnl with live position P&L
-    cycle_pos_pnl = bot.status.get("position_pnl", 0.0)
-    live_day_pnl = day_pnl - cycle_pos_pnl + position_pnl
+    # Get realized P&L from trades database (accurate across restarts)
+    mode = "live" if not target_bot.paper_mode else "paper"
+    trades_data = get_trades_with_pnl(mode=mode, asset=asset)
+    realized_pnl = trades_data["summary"]["net_pnl"]
+
+    # Total day_pnl = realized + unrealized position P&L
+    live_day_pnl = realized_pnl + position_pnl
 
     return {
-        "running": bot.status["running"],
+        "running": target_bot.status["running"],
         "balance": balance_num,
         "day_pnl": live_day_pnl,
         "position_pnl": position_pnl,
@@ -151,81 +220,88 @@ async def api_status():
         "position": pos_label,
         "active_position": pos,
         "market": ticker or "—",
-        "last_action": bot.status.get("last_action", "Idle"),
-        "cycle_count": bot.status["cycle_count"],
+        "last_action": target_bot.status.get("last_action", "Idle"),
+        "cycle_count": target_bot.status["cycle_count"],
         "decision": decision.get("decision", "—") if decision else "—",
         "confidence": decision.get("confidence", 0) if decision else 0,
         "reasoning": decision.get("reasoning", "") if decision else "",
-        "trading_enabled": config.TRADING_ENABLED,
-        "env": config.KALSHI_ENV,
-        "paper_mode": config.KALSHI_ENV == "demo",
-        "alpha": alpha_monitor.get_status(),
-        "alpha_override": bot.status.get("alpha_override"),
-        "alpha_signal": bot.status.get("alpha_signal"),
-        "alpha_signal_diff": bot.status.get("alpha_signal_diff"),
+        "trading_enabled": target_bot.cfg.TRADING_ENABLED,
+        "asset": asset,
+        "mode": target_bot.mode,
+        "paper_mode": target_bot.paper_mode,
+        "alpha": alpha.get_status() if alpha else {},
+        "alpha_override": target_bot.status.get("alpha_override"),
+        "alpha_signal": target_bot.status.get("alpha_signal"),
+        "alpha_signal_diff": target_bot.status.get("alpha_signal_diff"),
         "orderbook": ob_snapshot,
-        "seconds_to_close": bot.status.get("seconds_to_close"),
-        "strike_price": bot.status.get("strike_price"),
-        "close_time": bot.status.get("close_time"),
-        "market_title": bot.status.get("market_title"),
-        "dashboard": _patch_dashboard(bot.status.get("dashboard"), best_bid, best_ask),
+        "seconds_to_close": target_bot.status.get("seconds_to_close"),
+        "strike_price": target_bot.status.get("strike_price"),
+        "close_time": target_bot.status.get("close_time"),
+        "market_title": target_bot.status.get("market_title"),
+        "dashboard": _patch_dashboard(target_bot.status.get("dashboard"), best_bid, best_ask, target_bot.cfg),
     }
 
 
-def _patch_dashboard(db: dict | None, best_bid: int, best_ask: int) -> dict | None:
+def _patch_dashboard(db: dict | None, best_bid: int, best_ask: int, cfg=None) -> dict | None:
     """Patch dashboard with live data so guards/exits always reflect current config."""
     if not db:
         return db
+    # Use per-bot config if provided, otherwise fall back to global
+    if cfg is None:
+        cfg = config
     # Shallow copy to avoid mutating bot.status
     db = {**db}
     if db.get("guards"):
         guards = {**db["guards"]}
         spread_val = best_ask - best_bid
         if guards.get("spread"):
-            guards["spread"] = {**guards["spread"], "value": spread_val, "blocked": spread_val > config.MAX_SPREAD_CENTS}
+            guards["spread"] = {**guards["spread"], "value": spread_val, "blocked": spread_val > cfg.MAX_SPREAD_CENTS}
         db["guards"] = guards
     # Patch exit rule thresholds with current config values
     if db.get("exits"):
         exits = {**db["exits"]}
         if exits.get("stop_loss"):
-            exits["stop_loss"] = {**exits["stop_loss"], "threshold": config.STOP_LOSS_CENTS}
+            exits["stop_loss"] = {**exits["stop_loss"], "threshold": cfg.STOP_LOSS_CENTS}
         if exits.get("hit_and_run"):
-            exits["hit_and_run"] = {**exits["hit_and_run"], "threshold": config.HIT_RUN_PCT, "enabled": config.HIT_RUN_PCT > 0}
+            exits["hit_and_run"] = {**exits["hit_and_run"], "threshold": cfg.HIT_RUN_PCT, "enabled": cfg.HIT_RUN_PCT > 0}
         if exits.get("profit_take"):
-            exits["profit_take"] = {**exits["profit_take"], "threshold": config.PROFIT_TAKE_PCT}
+            exits["profit_take"] = {**exits["profit_take"], "threshold": cfg.PROFIT_TAKE_PCT}
         if exits.get("free_roll"):
-            exits["free_roll"] = {**exits["free_roll"], "threshold": config.FREE_ROLL_PRICE}
+            exits["free_roll"] = {**exits["free_roll"], "threshold": cfg.FREE_ROLL_PRICE}
         if exits.get("edge_exit"):
-            exits["edge_exit"] = {**exits["edge_exit"], "enabled": config.EDGE_EXIT_ENABLED, "min_hold": config.EDGE_EXIT_MIN_HOLD_SECS}
+            exits["edge_exit"] = {**exits["edge_exit"], "enabled": cfg.EDGE_EXIT_ENABLED, "min_hold": cfg.EDGE_EXIT_MIN_HOLD_SECS}
         db["exits"] = exits
     # Patch edge-exit config values
-    db["edge_exit_enabled"] = config.EDGE_EXIT_ENABLED
-    db["edge_exit_threshold"] = config.EDGE_EXIT_THRESHOLD_CENTS
-    db["edge_exit_cooldown"] = config.EDGE_EXIT_COOLDOWN_SECS
-    db["reentry_edge_premium"] = config.REENTRY_EDGE_PREMIUM
+    db["edge_exit_enabled"] = cfg.EDGE_EXIT_ENABLED
+    db["edge_exit_threshold"] = cfg.EDGE_EXIT_THRESHOLD_CENTS
+    db["edge_exit_cooldown"] = cfg.EDGE_EXIT_COOLDOWN_SECS
+    db["reentry_edge_premium"] = cfg.REENTRY_EDGE_PREMIUM
     return db
 
 
 @app.get("/api/debug/market")
-async def api_debug_market():
+async def api_debug_market(asset: str = "btc", bot: str = "paper"):
     """Expose raw market data for debugging strike extraction."""
-    return bot.status.get("_raw_market") or {}
+    target_bot = get_bot(asset, bot)
+    if not target_bot:
+        return {}
+    return target_bot.status.get("_raw_market") or {}
 
 
 @app.get("/api/logs")
-async def api_logs():
-    return get_recent_logs(80)
+async def api_logs(asset: str = ""):
+    return get_recent_logs(80, asset=asset)
 
 
 @app.get("/api/trades")
-async def api_trades(mode: str = ""):
-    return get_trades_with_pnl(mode=mode)
+async def api_trades(mode: str = "", asset: str = ""):
+    return get_trades_with_pnl(mode=mode, asset=asset)
 
 
 @app.get("/api/analytics")
-async def api_analytics(mode: str = ""):
+async def api_analytics(mode: str = "", asset: str = ""):
     from analytics import compute_analytics
-    return compute_analytics(mode=mode)
+    return compute_analytics(mode=mode, asset=asset)
 
 
 class ApplySuggestionRequest(BaseModel):
@@ -234,28 +310,37 @@ class ApplySuggestionRequest(BaseModel):
 
 
 @app.post("/api/analytics/apply")
-async def apply_suggestion(req: ApplySuggestionRequest):
+async def apply_suggestion(req: ApplySuggestionRequest, asset: str = "btc", bot: str = "paper"):
+    """Apply analytics suggestion to a specific asset/mode bot config."""
     if req.param not in TUNABLE_FIELDS:
         return {"ok": False, "msg": f"Unknown parameter: {req.param}"}
-    applied = set_tunables({req.param: req.value})
+    target_bot = get_bot(asset, bot)
+    if not target_bot:
+        return {"ok": False, "msg": f"Bot not initialized for {asset}/{bot}"}
+    applied = target_bot.cfg.update({req.param: req.value})
     if applied:
+        target_bot.cfg.save()  # Persist to DB
         from database import log_event
-        log_event("CONFIG", f"Analytics suggestion applied: {req.param} → {req.value}")
-        return {"ok": True, "applied": applied}
+        log_event("CONFIG", f"[{asset.upper()}/{bot}] Analytics suggestion: {req.param} → {req.value}", asset)
+        return {"ok": True, "applied": applied, "asset": asset, "bot": bot}
     return {"ok": False, "msg": "Failed to apply"}
 
 
 @app.post("/api/backfill/settlements")
-async def backfill_settlements():
+async def backfill_settlements(asset: str = "btc"):
     """One-time backfill: find all unsettled live trades and query Kalshi for results."""
     unsettled = get_all_unsettled_live_entries()
     if not unsettled:
         return {"ok": True, "msg": "No unsettled live trades found", "settled": 0}
     results = []
+    # Use live bot for settlement (has Kalshi API access)
+    live_bot = get_bot(asset, "live")
+    if not live_bot:
+        return {"ok": False, "msg": f"Live bot not initialized for {asset}"}
     for entry in unsettled:
         ticker = entry["market_id"]
         try:
-            await bot._settle_live_positions(ticker)
+            await live_bot._settle_live_positions(ticker)
             results.append({"ticker": ticker, "status": "settled"})
         except Exception as exc:
             results.append({"ticker": ticker, "status": "error", "error": str(exc)})
@@ -277,20 +362,24 @@ async def backfill_buys():
 
 
 @app.get("/api/kalshi/fills")
-async def kalshi_fills(since: str = ""):
+async def kalshi_fills(asset: str = "btc", since: str = ""):
     """Query Kalshi for actual fills since a given ISO timestamp."""
     params = {"limit": 100}
     if since:
         params["min_ts"] = since
     try:
-        data = await bot._get("/portfolio/fills", params=params)
+        # Use live bot for Kalshi API access
+        live_bot = get_bot(asset, "live")
+        if not live_bot:
+            return {"error": f"Live bot not initialized for {asset}"}
+        data = await live_bot._get("/portfolio/fills", params=params)
         return data
     except Exception as exc:
         return {"error": str(exc)}
 
 
 @app.post("/api/reconcile")
-async def reconcile_trades(since_utc: str = "2026-01-01T00:00:00Z"):
+async def reconcile_trades(asset: str = "btc", since_utc: str = "2026-02-01T00:00:00Z"):
     """Reconcile trade log with actual Kalshi fills.
 
     Fetches all fills from Kalshi, queries market results for expired markets,
@@ -299,6 +388,13 @@ async def reconcile_trades(since_utc: str = "2026-01-01T00:00:00Z"):
     from datetime import datetime, timezone
     from database import log_event
     from itertools import chain
+    from config import ASSET_CONFIG
+
+    live_bot = get_bot(asset, "live")
+    if not live_bot:
+        return {"error": f"Live bot not initialized for {asset}"}
+
+    market_series = ASSET_CONFIG.get(asset, {}).get("market_series", "KXBTC15M")
     cutoff = datetime.fromisoformat(since_utc.replace("Z", "+00:00"))
 
     # 1. Fetch all Kalshi fills (paginated)
@@ -309,7 +405,7 @@ async def reconcile_trades(since_utc: str = "2026-01-01T00:00:00Z"):
         if cursor:
             params["cursor"] = cursor
         try:
-            data = await bot._get("/portfolio/fills", params=params)
+            data = await live_bot._get("/portfolio/fills", params=params)
         except Exception as exc:
             return {"error": f"Failed to fetch fills: {exc}"}
         fills = data.get("fills", [])
@@ -324,10 +420,10 @@ async def reconcile_trades(since_utc: str = "2026-01-01T00:00:00Z"):
         if not cursor:
             break
 
-    # Filter to fills since cutoff, only KXBTC15M markets
+    # Filter to fills since cutoff, only for this asset's market series
     recent = [
         f for f in all_fills
-        if f["ticker"].startswith("KXBTC15M-")
+        if f["ticker"].startswith(f"{market_series}-")
         and datetime.fromisoformat(f["created_time"].replace("Z", "+00:00")) >= cutoff
     ]
 
@@ -378,7 +474,7 @@ async def reconcile_trades(since_utc: str = "2026-01-01T00:00:00Z"):
         # Query Kalshi for market result
         market_result = ""
         try:
-            mkt_data = await bot._get(f"/markets/{ticker}")
+            mkt_data = await live_bot._get(f"/markets/{ticker}")
             market_data = mkt_data.get("market", mkt_data)
             market_result = market_data.get("result", "")
         except Exception:
@@ -459,10 +555,12 @@ async def reconcile_trades(since_utc: str = "2026-01-01T00:00:00Z"):
 
             # Add SETTLE entry for remaining position
             if mkt["result"] and (mkt["remaining"]["yes"] > 0 or mkt["remaining"]["no"] > 0):
-                # Extract settle time from ticker (e.g., KXBTC15M-26FEB030900-00 -> Feb 3 09:00 UTC 2026)
+                # Extract settle time from ticker (e.g., KXBTC15M-26FEB030900-00 -> Feb 3 09:00 ET 2026)
+                # Kalshi uses Eastern time for contract times
                 settle_ts = datetime.now(timezone.utc).isoformat()  # fallback
                 try:
                     import re
+                    from zoneinfo import ZoneInfo
                     # Format: -YYMMMDDHHNN- where YY=year, MMM=month, DD=day, HH=hour, NN=minute
                     match = re.search(r"-(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})-", ticker)
                     if match:
@@ -471,7 +569,9 @@ async def reconcile_trades(since_utc: str = "2026-01-01T00:00:00Z"):
                                   "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
                         mon = months.get(mon_str, 1)
                         year = 2000 + int(yr)
-                        settle_dt = datetime(year, mon, int(day), int(hr), int(mn), 0, tzinfo=timezone.utc)
+                        # Parse as Eastern time, store in ISO format (will be converted to Pacific for display)
+                        et = ZoneInfo("America/New_York")
+                        settle_dt = datetime(year, mon, int(day), int(hr), int(mn), 0, tzinfo=et)
                         settle_ts = settle_dt.isoformat()
                 except Exception:
                     pass
@@ -504,7 +604,7 @@ async def reconcile_trades(since_utc: str = "2026-01-01T00:00:00Z"):
             fees_cents=mkt["fees_cents"],
         )
 
-    log_event("RECONCILE", f"Reconciled {len(results)} markets from Kalshi fills")
+    log_event("RECONCILE", f"Reconciled {len(results)} markets from Kalshi fills", asset)
 
     # Summary
     total_pnl = sum(m["pnl_cents"] for m in results if m["result"]) / 100.0
@@ -526,49 +626,72 @@ async def reconcile_trades(since_utc: str = "2026-01-01T00:00:00Z"):
 # ------------------------------------------------------------------
 
 @app.post("/api/start")
-async def start_bot():
-    global bot_task
-    if bot.running:
-        return {"ok": False, "msg": "Already running"}
-    bot_task = asyncio.create_task(bot.run())
-    set_setting("bot_running", "1")
-    return {"ok": True}
+async def start_bot(asset: str = "btc", bot: str = "paper"):
+    """Start the specified bot (asset + mode)."""
+    global bot_tasks
+    target_bot = get_bot(asset, bot)
+    if not target_bot:
+        return {"ok": False, "msg": f"Bot not initialized for {asset}/{bot}"}
+    if target_bot.running:
+        return {"ok": False, "msg": f"{asset.upper()} {bot.capitalize()} bot already running"}
+
+    key = (asset, bot)
+    task = asyncio.create_task(target_bot.run())
+    bot_tasks[key] = task
+    set_setting(f"{asset}_{bot}_bot_running", "1")
+    return {"ok": True, "asset": asset, "bot": bot}
 
 
 @app.post("/api/stop")
-async def stop_bot():
-    if not bot.running:
-        return {"ok": False, "msg": "Not running"}
-    bot.stop()
-    set_setting("bot_running", "0")
-    return {"ok": True}
+async def stop_bot(asset: str = "btc", bot: str = "paper"):
+    """Stop the specified bot (asset + mode)."""
+    target_bot = get_bot(asset, bot)
+    if not target_bot:
+        return {"ok": False, "msg": f"Bot not initialized for {asset}/{bot}"}
+    if not target_bot.running:
+        return {"ok": False, "msg": f"{asset.upper()} {bot.capitalize()} bot not running"}
+
+    target_bot.stop()
+    set_setting(f"{asset}_{bot}_bot_running", "0")
+    return {"ok": True, "asset": asset, "bot": bot}
 
 
 @app.post("/api/paper/reset")
-async def reset_paper():
-    if not bot.paper_mode:
-        return {"ok": False, "msg": "Not in paper mode"}
-    was_running = bot.running
+async def reset_paper(asset: str = "btc"):
+    """Reset paper trading state (balance, positions) for specified asset."""
+    paper_bot = get_bot(asset, "paper")
+    if not paper_bot:
+        return {"ok": False, "msg": f"Paper bot not initialized for {asset}"}
+    was_running = paper_bot.running
     if was_running:
-        bot.stop()
-        set_setting("bot_running", "0")
+        paper_bot.stop()
+        set_setting(f"{asset}_paper_bot_running", "0")
         await asyncio.sleep(1)
-    bot.reset_paper_trading()
-    return {"ok": True, "balance": config.PAPER_STARTING_BALANCE}
+    paper_bot.reset_paper_trading()
+    return {"ok": True, "asset": asset, "balance": paper_bot.cfg.PAPER_STARTING_BALANCE}
 
 
-class EnvRequest(BaseModel):
-    env: str
+@app.get("/api/status/both")
+async def api_status_both(asset: str = "btc"):
+    """Get status for both paper and live bots for specified asset."""
+    paper_status = await api_status(asset=asset, bot="paper")
+    live_status = await api_status(asset=asset, bot="live")
+    return {
+        "paper": paper_status,
+        "live": live_status,
+    }
 
 
-@app.post("/api/env")
-async def switch_env(req: EnvRequest):
-    if req.env not in ("demo", "live"):
-        return {"ok": False, "msg": "Invalid env"}
-    if bot.running:
-        bot.stop()
-    await bot.switch_environment(req.env)
-    return {"ok": True, "env": req.env}
+@app.get("/api/status/all")
+async def api_status_all():
+    """Get status for all 6 bots (3 assets × 2 modes)."""
+    result = {}
+    for asset in SUPPORTED_ASSETS:
+        result[asset] = {
+            "paper": await api_status(asset=asset, bot="paper"),
+            "live": await api_status(asset=asset, bot="live"),
+        }
+    return result
 
 
 class ChatRequest(BaseModel):
@@ -576,8 +699,12 @@ class ChatRequest(BaseModel):
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest):
-    reply = await bot.agent.chat(req.message, bot.status)
+async def chat(req: ChatRequest, asset: str = "btc", bot: str = "paper"):
+    """Chat with the specified bot's agent."""
+    target_bot = get_bot(asset, bot)
+    if not target_bot:
+        return {"reply": f"Bot not initialized for {asset}/{bot}"}
+    reply = await target_bot.agent.chat(req.message, target_bot.status)
     return {"reply": reply}
 
 
@@ -586,19 +713,28 @@ async def chat(req: ChatRequest):
 # ------------------------------------------------------------------
 
 @app.get("/api/config")
-async def get_config():
-    values = get_tunables()
+async def get_config(asset: str = "btc", bot: str = "paper"):
+    """Get config for specified asset and mode."""
+    target_bot = get_bot(asset, bot)
+    if not target_bot:
+        return {"error": f"Bot not initialized for {asset}/{bot}"}
+    values = target_bot.cfg.get_all()
     meta = {k: {**TUNABLE_FIELDS[k], "value": values[k]} for k in TUNABLE_FIELDS}
     return meta
 
 
 @app.post("/api/config")
-async def update_config(updates: dict):
-    applied = set_tunables(updates)
+async def update_config(updates: dict, asset: str = "btc", bot: str = "paper"):
+    """Update config for specified asset and mode."""
+    target_bot = get_bot(asset, bot)
+    if not target_bot:
+        return {"ok": False, "msg": f"Bot not initialized for {asset}/{bot}"}
+    applied = target_bot.cfg.update(updates)
+    target_bot.cfg.save()  # Persist to DB
     from database import log_event
     for k, v in applied.items():
-        log_event("CONFIG", f"{k} → {v}")
-    return {"ok": True, "applied": applied}
+        log_event("CONFIG", f"[{asset.upper()}/{bot}] {k} → {v}", asset)
+    return {"ok": True, "applied": applied, "asset": asset, "bot": bot}
 
 
 # ------------------------------------------------------------------

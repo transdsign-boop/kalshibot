@@ -47,7 +47,8 @@ def init_db():
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts          TEXT NOT NULL,
                 level       TEXT NOT NULL,
-                message     TEXT NOT NULL
+                message     TEXT NOT NULL,
+                asset       TEXT DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS agent_decisions (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,13 +123,19 @@ def init_db():
             conn.execute("ALTER TABLE live_market_pnl ADD COLUMN fees_cents REAL")
         except sqlite3.OperationalError:
             pass
+        # Migration: add asset column to logs table
+        try:
+            conn.execute("ALTER TABLE logs ADD COLUMN asset TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
 
-def log_event(level: str, message: str):
+def log_event(level: str, message: str, asset: str = ""):
+    """Log an event with optional asset context for filtering."""
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO logs (ts, level, message) VALUES (?, ?, ?)",
-            (datetime.now(timezone.utc).isoformat(), level, message),
+            "INSERT INTO logs (ts, level, message, asset) VALUES (?, ?, ?, ?)",
+            (datetime.now(timezone.utc).isoformat(), level, message, asset),
         )
 
 
@@ -158,12 +165,25 @@ def record_decision(market_id: str | None, decision: str, confidence: float,
         )
 
 
-def get_recent_logs(limit: int = 50) -> list[dict]:
+def get_recent_logs(limit: int = 50, asset: str = "") -> list[dict]:
+    """Get recent logs, optionally filtered by asset.
+
+    When asset is specified, only returns logs for that specific asset.
+    Old logs with empty asset are excluded to avoid cross-contamination.
+    """
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT ts, level, message FROM logs ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        if asset:
+            # Strict filter: only show logs for this specific asset
+            rows = conn.execute(
+                "SELECT ts, level, message, asset FROM logs "
+                "WHERE asset = ? ORDER BY id DESC LIMIT ?",
+                (asset, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT ts, level, message, asset FROM logs ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -198,23 +218,48 @@ def get_all_live_market_pnl() -> dict[str, float]:
     return {r["market_id"]: r["pnl_cents"] / 100.0 for r in rows}
 
 
-def get_all_live_market_details() -> dict[str, dict]:
-    """Get all live market details including cost, revenue, fees."""
+def get_all_live_market_details(since_date: str = "2026-02-01") -> dict[str, dict]:
+    """Get all live market details including cost, revenue, fees.
+
+    since_date: Only include markets on or after this date (YYYY-MM-DD).
+    Filters by ticker date (e.g., KXBTC15M-26FEB01xxxx contains Feb 01 2026).
+    """
+    import re
     with get_db() as conn:
         rows = conn.execute(
             "SELECT market_id, pnl_cents, result, total_cost_cents, total_revenue_cents, fees_cents "
             "FROM live_market_pnl"
         ).fetchall()
-    return {
-        r["market_id"]: {
+
+    # Parse since_date to compare with ticker dates
+    months = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+              "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+    since_parts = since_date.split("-")
+    since_year = int(since_parts[0])
+    since_month = int(since_parts[1])
+    since_day = int(since_parts[2])
+
+    result = {}
+    for r in rows:
+        mid = r["market_id"]
+        # Parse ticker date: KXBTC15M-26FEB031045-45 -> year=26, month=FEB, day=03
+        match = re.search(r"-(\d{2})([A-Z]{3})(\d{2})\d{4}-", mid)
+        if match:
+            yr = 2000 + int(match.group(1))
+            mon = months.get(match.group(2), 1)
+            day = int(match.group(3))
+            ticker_date = (yr, mon, day)
+            cutoff_date = (since_year, since_month, since_day)
+            if ticker_date < cutoff_date:
+                continue
+        result[mid] = {
             "pnl": r["pnl_cents"] / 100.0 if r["pnl_cents"] else 0,
             "result": r["result"],
             "cost": r["total_cost_cents"] / 100.0 if r["total_cost_cents"] else 0,
             "revenue": r["total_revenue_cents"] / 100.0 if r["total_revenue_cents"] else 0,
             "fees": r["fees_cents"] / 100.0 if r["fees_cents"] else 0,
         }
-        for r in rows
-    }
+    return result
 
 
 def get_recent_trades(limit: int = 20) -> list[dict]:
@@ -243,16 +288,21 @@ def get_todays_trades() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def _trades_from_snapshots(mode: str = "") -> tuple:
+def _trades_from_snapshots(mode: str = "", asset: str = "") -> tuple:
     """Build trade-log-compatible records from trade_snapshots table.
 
     Returns (trades, wins, losses, pending, net_pnl, total_completed, win_rate).
     """
-    mode_filter = ""
+    asset_series = {"btc": "KXBTC15M", "eth": "KXETH15M", "sol": "KXSOL15M"}
+    conditions = []
     if mode == "paper":
-        mode_filter = "WHERE market_id LIKE '[PAPER]%'"
+        conditions.append("market_id LIKE '[PAPER]%'")
     elif mode == "live":
-        mode_filter = "WHERE market_id NOT LIKE '[PAPER]%'"
+        conditions.append("market_id NOT LIKE '[PAPER]%'")
+    if asset and asset in asset_series:
+        series = asset_series[asset]
+        conditions.append(f"(market_id LIKE '{series}%' OR market_id LIKE '[PAPER] {series}%')")
+    mode_filter = "WHERE " + " AND ".join(conditions) if conditions else ""
     with get_db() as conn:
         rows = conn.execute(
             f"SELECT ts, market_id, side, action, price_cents, quantity, pnl_cents "
@@ -303,21 +353,33 @@ def _trades_from_snapshots(mode: str = "") -> tuple:
     return trades, wins, losses, pending, net_pnl, total_completed, win_rate
 
 
-def get_trades_with_pnl(limit: int = 0, mode: str = "") -> dict:
+def get_trades_with_pnl(limit: int = 0, mode: str = "", since: str = "2026-02-01", asset: str = "") -> dict:
     """Return trades with per-market P&L and summary stats.
 
     By default returns ALL trades (limit=0). Pass a positive limit to cap results.
     mode: "paper" = only [PAPER] trades, "live" = only non-[PAPER] trades, "" = all.
+    since: Only include trades on or after this date (YYYY-MM-DD format).
+    asset: Filter by asset ("btc", "eth", "sol"). Empty = all assets.
 
     For live trades, uses actual P&L from Kalshi (stored via reconcile).
     For paper trades, calculates P&L from buy/sell prices.
     """
+    # Map asset to market series prefix
+    asset_series = {"btc": "KXBTC15M", "eth": "KXETH15M", "sol": "KXSOL15M"}
+
     with get_db() as conn:
-        where = ""
+        conditions = []
         if mode == "paper":
-            where = "WHERE market_id LIKE '[PAPER]%'"
+            conditions.append("market_id LIKE '[PAPER]%'")
         elif mode == "live":
-            where = "WHERE market_id NOT LIKE '[PAPER]%'"
+            conditions.append("market_id NOT LIKE '[PAPER]%'")
+        if since:
+            conditions.append(f"ts >= '{since}'")
+        if asset and asset in asset_series:
+            series = asset_series[asset]
+            # Handle both paper ([PAPER] KXBTC15M-...) and live (KXBTC15M-...)
+            conditions.append(f"(market_id LIKE '{series}%' OR market_id LIKE '[PAPER] {series}%')")
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
         if limit > 0:
             rows = conn.execute(
                 f"SELECT ts, market_id, side, action, price, quantity FROM trades {where} ORDER BY id DESC LIMIT ?",
@@ -330,8 +392,9 @@ def get_trades_with_pnl(limit: int = 0, mode: str = "") -> dict:
 
     trades = [dict(r) for r in rows]
 
-    # For live mode, get actual P&L and details from Kalshi reconciliation
-    live_details = get_all_live_market_details() if mode == "live" else {}
+    # Get actual P&L and details from Kalshi reconciliation (for live trades)
+    # Load this regardless of mode since mixed queries (mode="") should still use accurate P&L
+    live_details = get_all_live_market_details() if mode != "paper" else {}
     live_pnl = {k: v["pnl"] for k, v in live_details.items()}
 
     # Group by market_id to track positions
@@ -393,7 +456,7 @@ def get_trades_with_pnl(limit: int = 0, mode: str = "") -> dict:
     # If no trades found, fall back to trade_snapshots (covers live mode where
     # trades table may be empty but snapshots recorded the activity)
     if not trades:
-        trades, wins, losses, pending, net_pnl, total_completed, win_rate = _trades_from_snapshots(mode)
+        trades, wins, losses, pending, net_pnl, total_completed, win_rate = _trades_from_snapshots(mode, asset)
 
     return {
         "trades": trades,
@@ -433,16 +496,22 @@ def record_snapshot(snapshot: dict):
         )
 
 
-def get_completed_snapshots(limit: int = 0, mode: str = "") -> list[dict]:
+def get_completed_snapshots(limit: int = 0, mode: str = "", asset: str = "") -> list[dict]:
     """Return completed round-trip snapshots (exit joined with entry conditions).
 
     mode: "paper" = only [PAPER] trades, "live" = only non-[PAPER] trades, "" = all.
+    asset: Filter by asset ("btc", "eth", "sol"). Empty = all assets.
     """
-    mode_filter = ""
+    asset_series = {"btc": "KXBTC15M", "eth": "KXETH15M", "sol": "KXSOL15M"}
+    conditions = []
     if mode == "paper":
-        mode_filter = "AND e.market_id LIKE '[PAPER]%'"
+        conditions.append("e.market_id LIKE '[PAPER]%'")
     elif mode == "live":
-        mode_filter = "AND e.market_id NOT LIKE '[PAPER]%'"
+        conditions.append("e.market_id NOT LIKE '[PAPER]%'")
+    if asset and asset in asset_series:
+        series = asset_series[asset]
+        conditions.append(f"(e.market_id LIKE '{series}%' OR e.market_id LIKE '[PAPER] {series}%')")
+    mode_filter = "AND " + " AND ".join(conditions) if conditions else ""
     with get_db() as conn:
         query = f"""
             SELECT e.*,
@@ -604,20 +673,26 @@ def get_unsettled_entry(market_id: str) -> dict | None:
     return dict(trade_row) if trade_row else None
 
 
-def get_legacy_round_trips(mode: str = "") -> list[dict]:
+def get_legacy_round_trips(mode: str = "", asset: str = "") -> list[dict]:
     """Build round-trip trade records from the trades table for analytics fallback.
 
     Returns one dict per completed round-trip (BUY + exit) with fields compatible
     with the analytics engine: side, action (exit type), pnl_cents, hold_duration_s,
     entry_price_cents, quantity.
     mode: "paper" = only [PAPER] trades, "live" = only non-[PAPER] trades, "" = all.
+    asset: Filter by asset ("btc", "eth", "sol"). Empty = all assets.
     """
+    asset_series = {"btc": "KXBTC15M", "eth": "KXETH15M", "sol": "KXSOL15M"}
     with get_db() as conn:
-        where = ""
+        conditions = []
         if mode == "paper":
-            where = "WHERE market_id LIKE '[PAPER]%'"
+            conditions.append("market_id LIKE '[PAPER]%'")
         elif mode == "live":
-            where = "WHERE market_id NOT LIKE '[PAPER]%'"
+            conditions.append("market_id NOT LIKE '[PAPER]%'")
+        if asset and asset in asset_series:
+            series = asset_series[asset]
+            conditions.append(f"(market_id LIKE '{series}%' OR market_id LIKE '[PAPER] {series}%')")
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
         rows = conn.execute(
             f"SELECT ts, market_id, side, action, price, quantity FROM trades {where} ORDER BY id"
         ).fetchall()

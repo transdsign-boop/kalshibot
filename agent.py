@@ -10,7 +10,7 @@ except ImportError:
 
 
 class MarketAgent:
-    def __init__(self):
+    def __init__(self, bot_config=None):
         # Anthropic client is only needed for chat, not trading decisions
         self.client = None
         if HAS_ANTHROPIC and config.ANTHROPIC_API_KEY:
@@ -19,6 +19,8 @@ class MarketAgent:
                 timeout=60.0,
             )
         self.last_decision: dict | None = None
+        # Per-bot config (falls back to global config if not provided)
+        self.cfg = bot_config
 
     # ------------------------------------------------------------------
     # Rule-based trading decision (replaces Claude API call)
@@ -67,15 +69,17 @@ class MarketAgent:
         time_factor = min(1.0, max(0.0, secs_left / max_contract_secs))
 
         # Build reasoning trace
+        asset_name = alpha_monitor.asset.upper() if hasattr(alpha_monitor, 'asset') else 'BTC'
         reasons = []
-        reasons.append(f"BTC {'above' if btc_vs_strike > 0 else 'below'} strike by ${abs(btc_vs_strike):.0f}")
+        reasons.append(f"{asset_name} {'above' if btc_vs_strike > 0 else 'below'} strike by ${abs(btc_vs_strike):.0f}")
         reasons.append(f"Fair: {fair_yes_cents}c YES ({fair_yes_prob:.0%})")
         reasons.append(f"Vol: {regime} (${vol['vol_dollar_per_min']:.1f}/min)")
         reasons.append(f"Trend: ${change_1m:+.0f}/1m")
         reasons.append(f"Time: {secs_left:.0f}s left")
 
-        # Low-vol sit-out
-        if config.RULE_SIT_OUT_LOW_VOL and regime == "low":
+        # Low-vol sit-out (use per-bot config if available)
+        sit_out = self.cfg.RULE_SIT_OUT_LOW_VOL if self.cfg else config.RULE_SIT_OUT_LOW_VOL
+        if sit_out and regime == "low":
             return self._hold(f"Low vol — sitting out. {'; '.join(reasons)}")
 
         # Compute edge on each side
@@ -87,7 +91,9 @@ class MarketAgent:
         reasons.append(f"YES edge: {yes_edge:+d}c (fair {fair_yes_cents} vs ask {yes_cost})")
         reasons.append(f"NO edge: {no_edge:+d}c (fair {100 - fair_yes_cents} vs cost {no_cost})")
 
-        min_edge = config.MIN_EDGE_CENTS
+        # Use per-bot config if available
+        min_edge = self.cfg.MIN_EDGE_CENTS if self.cfg else config.MIN_EDGE_CENTS
+        trend_vel = self.cfg.TREND_FOLLOW_VELOCITY if self.cfg else config.TREND_FOLLOW_VELOCITY
 
         # Trend confirmation
         trend_confirms_yes = dir_1m > 0
@@ -103,7 +109,7 @@ class MarketAgent:
             yes_score = yes_edge / 100.0
             if trend_confirms_yes:
                 yes_score += 0.10
-                if regime == "high" and abs(vel_1m) > config.TREND_FOLLOW_VELOCITY:
+                if regime == "high" and abs(vel_1m) > trend_vel:
                     yes_score += 0.05
             yes_score *= time_factor
 
@@ -113,7 +119,7 @@ class MarketAgent:
             no_score = no_edge / 100.0
             if trend_confirms_no:
                 no_score += 0.10
-                if regime == "high" and abs(vel_1m) > config.TREND_FOLLOW_VELOCITY:
+                if regime == "high" and abs(vel_1m) > trend_vel:
                     no_score += 0.05
             no_score *= time_factor
 
@@ -135,8 +141,9 @@ class MarketAgent:
             return self._hold(f"No edge. {'; '.join(reasons)}")
 
         # Confidence gate
-        if confidence < config.RULE_MIN_CONFIDENCE:
-            return self._hold(f"Low confidence {confidence:.0%}. {'; '.join(reasons)}")
+        min_conf = self.cfg.RULE_MIN_CONFIDENCE if self.cfg else config.RULE_MIN_CONFIDENCE
+        if confidence < min_conf:
+            return self._hold(f"Low confidence {confidence:.0%}. {'; '.join(reasons)}", confidence=confidence)
 
         reasoning = "; ".join(reasons)
         self.last_decision = {
@@ -151,14 +158,16 @@ class MarketAgent:
             confidence=confidence,
             reasoning=reasoning,
         )
-        log_event("RULES", f"{decision} ({confidence:.0%}) — {reasoning[:200]}")
+        asset = self.cfg.asset if self.cfg else ""
+        log_event("RULES", f"{decision} ({confidence:.0%}) — {reasoning[:200]}", asset)
         return self.last_decision
 
-    def _hold(self, reasoning: str) -> dict:
-        """Return a HOLD decision."""
-        result = {"decision": "HOLD", "confidence": 0.0, "reasoning": reasoning}
+    def _hold(self, reasoning: str, confidence: float = 0.0) -> dict:
+        """Return a HOLD decision, preserving calculated confidence for display."""
+        result = {"decision": "HOLD", "confidence": confidence, "reasoning": reasoning}
         self.last_decision = result
-        log_event("RULES", f"HOLD — {reasoning[:200]}")
+        asset = self.cfg.asset if self.cfg else ""
+        log_event("RULES", f"HOLD ({confidence:.0%}) — {reasoning[:200]}", asset)
         return result
 
     # ------------------------------------------------------------------
