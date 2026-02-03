@@ -708,7 +708,9 @@ class TradingBot:
         try:
             entry = get_unsettled_entry(old_ticker)
             if not entry:
-                return  # Already has an exit record, or no entry at all
+                # Already has an exit record — still reconcile to get accurate P&L
+                await self._reconcile_market(old_ticker)
+                return
 
             side = entry["side"]
             qty = entry.get("position_qty") or entry.get("quantity") or 0
