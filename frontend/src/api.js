@@ -72,3 +72,11 @@ export async function applySuggestion(param, value) {
   });
   return res.json();
 }
+
+export async function postReconcile() {
+  // Use a very old date to fetch ALL trades from the account
+  const res = await fetch(`${BASE}/api/reconcile?since_utc=2020-01-01T00:00:00Z`, {
+    method: 'POST',
+  });
+  return res.json();
+}
