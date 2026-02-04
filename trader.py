@@ -1222,13 +1222,12 @@ class TradingBot:
             else:
                 self.status["position_pnl"] = 0.0
 
-            # All-time P&L: paper uses fixed starting balance, live uses session start
+            # All-time P&L: use fixed starting balance for both modes
             if self.paper_mode:
                 start_bal = config.PAPER_STARTING_BALANCE
-                all_time_pnl = (balance + total_exposure) - start_bal
             else:
-                start_bal = self._start_balance + self._start_exposure
-                all_time_pnl = settled_pnl
+                start_bal = config.LIVE_STARTING_BALANCE
+            all_time_pnl = (balance + total_exposure) - start_bal
             self.status["day_pnl"] = all_time_pnl + self.status["position_pnl"]
 
             # Total account value: cash + mark-to-market of all positions

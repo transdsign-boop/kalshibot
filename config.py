@@ -100,6 +100,9 @@ RULE_MIN_CONFIDENCE = float(os.getenv("RULE_MIN_CONFIDENCE", "0.6"))         # m
 PAPER_STARTING_BALANCE = float(os.getenv("PAPER_STARTING_BALANCE", "100.0"))
 PAPER_FILL_FRACTION = float(os.getenv("PAPER_FILL_FRACTION", "1.0"))  # fraction of book depth filled (1.0 = full depth, crossing orders fill against all resting liquidity)
 
+# Live trading starting balance (for PnL calculation - set to your balance on Feb 1, 2026)
+LIVE_STARTING_BALANCE = float(os.getenv("LIVE_STARTING_BALANCE", "277.0"))
+
 # Loop interval
 POLL_INTERVAL_SECONDS = 10
 
@@ -141,6 +144,7 @@ TUNABLE_FIELDS = {
     "REENTRY_EDGE_PREMIUM":     {"type": "int",   "min": 0,  "max": 15},
     "PAPER_STARTING_BALANCE":   {"type": "float", "min": 10,  "max": 100000},
     "PAPER_FILL_FRACTION":      {"type": "float", "min": 0.05, "max": 1.0},
+    "LIVE_STARTING_BALANCE":    {"type": "float", "min": 10,  "max": 100000},
 }
 
 
