@@ -115,13 +115,13 @@ export default function BotStatus({ status, tradeData }) {
             {/* Total P&L from trade log (actual Kalshi data) */}
             <div className="flex items-baseline gap-1">
               <span className={`text-lg font-bold font-mono ${totalTradePnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                {totalTradePnl >= 0 ? '+' : ''}{totalTradePnl.toFixed(2)}
+                {totalTradePnl >= 0 ? '+$' : '-$'}{Math.abs(totalTradePnl).toFixed(2)}
               </span>
               <span className="text-[9px] text-gray-600">{totalTrades}t</span>
             </div>
             {/* Session P&L */}
             <span className={`text-sm font-mono ${pnl >= 0 ? 'text-green-400/60' : 'text-red-400/60'}`}>
-              {pnl >= 0 ? '+' : ''}{pnl.toFixed(2)}
+              {pnl >= 0 ? '+$' : '-$'}{Math.abs(pnl).toFixed(2)}
             </span>
           </div>
         </div>

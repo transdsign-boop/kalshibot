@@ -51,7 +51,7 @@ export default function TradeLog({ tradeData, mode }) {
               <span className="text-green-400">{wins}W</span>
               <span className="text-red-400">{losses}L</span>
               <span className={`font-semibold ${net_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                {net_pnl >= 0 ? '+' : ''}{net_pnl.toFixed(2)}
+                {net_pnl >= 0 ? '+$' : '-$'}{Math.abs(net_pnl).toFixed(2)}
               </span>
               <span className="text-gray-500">{(win_rate * 100).toFixed(0)}%</span>
             </>
@@ -112,7 +112,7 @@ function TradeGroup({ group }) {
           <span className="text-amber-400 font-semibold shrink-0">OPEN</span>
         ) : pnl != null ? (
           <span className={`shrink-0 font-semibold ${pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-            {pnl >= 0 ? 'W' : 'L'} {pnl >= 0 ? '+' : ''}{pnl.toFixed(2)}
+            {pnl >= 0 ? 'W' : 'L'} {pnl >= 0 ? '+$' : '-$'}{Math.abs(pnl).toFixed(2)}
           </span>
         ) : (
           <span className="text-gray-600 shrink-0">--</span>

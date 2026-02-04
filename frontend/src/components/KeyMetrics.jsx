@@ -7,8 +7,10 @@ export default function KeyMetrics({ status }) {
   const { balance, day_pnl, day_pnl_pct, position_pnl, position_pnl_pct, position, orderbook, active_position } = status
   const pnl = fmt(day_pnl)
   const pnlPct = fmt(day_pnl_pct)
-  const posPnl = fmt(position_pnl)
-  const posPnlPct = fmt(position_pnl_pct)
+  // Only show position P&L when there's an active position
+  const hasPosition = active_position && Math.abs(active_position.position || 0) > 0
+  const posPnl = hasPosition ? fmt(position_pnl) : 0
+  const posPnlPct = hasPosition ? fmt(position_pnl_pct) : 0
   const ob = orderbook || {}
 
   // Compute per-contract cost and current value for position context
