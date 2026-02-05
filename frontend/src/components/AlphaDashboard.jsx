@@ -90,7 +90,7 @@ function Editable({ configKey, display, type = 'int', scale = 1 }) {
   )
 }
 
-// Toggle for boolean config (e.g., LEAD_LAG_ENABLED)
+// Toggle for boolean config (e.g., EDGE_EXIT_ENABLED)
 function Toggle({ configKey, enabled }) {
   const [flash, setFlash] = useState(null)
 
@@ -190,8 +190,6 @@ export default function AlphaDashboard({ status }) {
   const signal = status.alpha_signal || 'NEUTRAL'
   const signalDiff = status.alpha_signal_diff || 0
   const override = status.alpha_override
-
-  const leadLagDot = !db.lead_lag_enabled ? 'gray' : signal !== 'NEUTRAL' ? 'green' : 'gray'
 
   const momDot = absMom >= db.extreme_delta_threshold ? 'red'
     : absMom >= db.delta_threshold ? 'green'
@@ -366,13 +364,6 @@ export default function AlphaDashboard({ status }) {
       {/* Section 1: Alpha Signals */}
       <CollapsibleSection title="Alpha Signals" badge={overrideBadge} summary={alphaSummary}>
         <Row
-          dot={leadLagDot}
-          label="Lead-Lag"
-          value={`${signal} ${signalDiff !== 0 ? (signalDiff > 0 ? '+' : '') + signalDiff.toFixed(0) : ''}`}
-          threshold={<Editable configKey="LEAD_LAG_THRESHOLD" display={`\u00b1$${db.lead_lag_threshold || 75}`} />}
-          badge={<Toggle configKey="LEAD_LAG_ENABLED" enabled={db.lead_lag_enabled} />}
-        />
-        <Row
           dot={momDot}
           label="Momentum"
           value={`${momentum >= 0 ? '+' : ''}${momentum.toFixed(1)}`}
@@ -405,7 +396,7 @@ export default function AlphaDashboard({ status }) {
             />
           </div>
           <span className={`text-[11px] font-mono font-semibold flex-shrink-0 ${confAbove ? 'text-green-400' : 'text-gray-500'}`}>{confPct}%</span>
-          <Editable configKey="RULE_MIN_CONFIDENCE" display={`≥${minConfPct}%`} type="float" scale={100} />
+          <Editable configKey="MIN_AGENT_CONFIDENCE" display={`≥${minConfPct}%`} type="float" scale={100} />
         </div>
         <Row
           dot={fairCents != null && midpoint != null && Math.abs(fairCents - midpoint) >= minEdge ? 'green' : 'gray'}

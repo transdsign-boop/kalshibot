@@ -303,8 +303,8 @@ def _suggest_min_edge(edge_data: dict, suggestions: list):
 
 
 def _suggest_min_confidence(conf_data: dict, suggestions: list):
-    """If low-confidence trades underperform, suggest raising RULE_MIN_CONFIDENCE."""
-    current = config.RULE_MIN_CONFIDENCE
+    """If low-confidence trades underperform, suggest raising MIN_AGENT_CONFIDENCE."""
+    current = config.MIN_AGENT_CONFIDENCE
 
     # Ordered bucket labels from low to high
     ordered = ["<60%", "60-69%", "70-79%", "80%+"]
@@ -324,7 +324,7 @@ def _suggest_min_confidence(conf_data: dict, suggestions: list):
 
     if profitable_threshold and profitable_threshold > current and losing_count >= MIN_SAMPLE_SIZE:
         suggestions.append({
-            "param": "RULE_MIN_CONFIDENCE",
+            "param": "MIN_AGENT_CONFIDENCE",
             "current_value": current,
             "suggested_value": profitable_threshold,
             "reasoning": (

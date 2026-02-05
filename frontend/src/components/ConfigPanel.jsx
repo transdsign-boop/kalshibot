@@ -57,10 +57,10 @@ const SETTINGS = {
     unit: '$',
     desc: 'Momentum threshold for aggressive execution. Crosses the spread (market order) instead of limit.',
   },
-  RULE_MIN_CONFIDENCE: {
-    label: 'Min Confidence',
+  MIN_AGENT_CONFIDENCE: {
+    label: 'Min Agent Confidence',
     unit: '',
-    desc: 'Minimum confidence score (0-1) from the rule engine to execute. Combines edge size, trend, and time remaining.',
+    desc: 'Minimum confidence score (0-1) from the Claude AI agent to execute a trade. Higher = stricter.',
   },
   FAIR_VALUE_K: {
     label: 'Fair Value Steepness',
@@ -76,15 +76,6 @@ const SETTINGS = {
     label: 'Low Vol Threshold',
     unit: '$/min',
     desc: 'BTC movement below this = low volatility. Bot sits out (if enabled). BTC quiet periods ~$50-80/min.',
-  },
-  RULE_SIT_OUT_LOW_VOL: {
-    label: 'Sit Out Low Vol',
-    desc: 'Skip trading entirely when volatility is below the low threshold. Disable to trade in flat markets too.',
-  },
-  TREND_FOLLOW_VELOCITY: {
-    label: 'Trend Velocity',
-    unit: '$/s',
-    desc: 'Minimum BTC price movement speed for trend-following bonus in high-vol mode. Lower = easier to trigger.',
   },
   EDGE_EXIT_ENABLED: {
     label: 'Edge Exit',
@@ -103,7 +94,7 @@ const GROUPS = [
   },
   {
     title: 'Strategy',
-    keys: ['EDGE_EXIT_ENABLED', 'EXTREME_DELTA_THRESHOLD', 'PROFIT_TAKE_MIN_SECS', 'RULE_MIN_CONFIDENCE', 'FAIR_VALUE_K', 'VOL_HIGH_THRESHOLD', 'VOL_LOW_THRESHOLD', 'RULE_SIT_OUT_LOW_VOL', 'TREND_FOLLOW_VELOCITY'],
+    keys: ['EDGE_EXIT_ENABLED', 'EXTREME_DELTA_THRESHOLD', 'PROFIT_TAKE_MIN_SECS', 'MIN_AGENT_CONFIDENCE', 'FAIR_VALUE_K', 'VOL_HIGH_THRESHOLD', 'VOL_LOW_THRESHOLD'],
   },
 ]
 

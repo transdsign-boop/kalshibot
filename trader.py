@@ -1399,13 +1399,11 @@ class TradingBot:
             dashboard["exits"] = exits
 
             # Config thresholds for frontend display
-            dashboard["lead_lag_enabled"] = config.LEAD_LAG_ENABLED
-            dashboard["lead_lag_threshold"] = config.LEAD_LAG_THRESHOLD
             dashboard["delta_threshold"] = config.DELTA_THRESHOLD
             dashboard["extreme_delta_threshold"] = config.EXTREME_DELTA_THRESHOLD
             dashboard["anchor_seconds_threshold"] = config.ANCHOR_SECONDS_THRESHOLD
             dashboard["min_edge_cents"] = config.MIN_EDGE_CENTS
-            dashboard["min_confidence"] = config.RULE_MIN_CONFIDENCE
+            dashboard["min_confidence"] = config.MIN_AGENT_CONFIDENCE
             dashboard["edge_exit_enabled"] = config.EDGE_EXIT_ENABLED
             dashboard["edge_exit_threshold"] = config.EDGE_EXIT_THRESHOLD_CENTS
             dashboard["edge_exit_cooldown"] = config.EDGE_EXIT_COOLDOWN_SECS
@@ -1695,12 +1693,12 @@ class TradingBot:
 
             # ── ALPHA ENGINE OVERRIDES ──────────────────────────────
             alpha_override = None
-            _trigger_type = "rules"
+            _trigger_type = "agent"
             if self.alpha and self.alpha.binance_connected and self.alpha.coinbase_connected:
-                momentum = self.alpha.delta_momentum
                 secs_left = market.get("_seconds_to_close", 0)
-                self.status["alpha_latency_delta"] = self.alpha.latency_delta
-                self.status["alpha_delta_momentum"] = momentum
+                delta = self.alpha.latency_delta
+                self.status["alpha_latency_delta"] = delta
+                self.status["alpha_delta_momentum"] = self.alpha.delta_momentum
                 self.status["alpha_delta_baseline"] = self.alpha.delta_baseline
                 self.status["alpha_projected_settlement"] = self.alpha.projected_settlement
                 self.status["alpha_binance_connected"] = True
@@ -1708,43 +1706,20 @@ class TradingBot:
                 self.status["alpha_weighted_price"] = self.alpha.get_weighted_global_price()
                 self.status["alpha_lead_lag_spread"] = self.alpha.lead_lag_spread
 
-                # Override 0: Lead-Lag Signal (weighted global price vs strike)
-                # Uses all 6 exchanges to detect when BTC has moved but Kalshi
-                # contracts haven't repriced yet (the "60-second lag" play).
-                # Only overrides if actual edge exists (Kalshi hasn't caught up).
+                # Override 1: Front-Run (raw Binance-Coinbase delta exceeds threshold)
+                # Edge-gated: only fires if actual mispricing exists in the orderbook
                 strike = self._extract_strike(market)
-                if config.LEAD_LAG_ENABLED and strike and strike > 0:
-                    signal, diff = self.alpha.get_signal(strike)
-                    self.status["alpha_signal"] = signal
-                    self.status["alpha_signal_diff"] = diff
-                    yes_edge = dashboard.get("yes_edge", 0)
-                    no_edge = dashboard.get("no_edge", 0)
-                    min_edge = config.MIN_EDGE_CENTS
-                    if signal == "BULLISH" and yes_edge >= min_edge:
-                        alpha_override = "BUY_YES"
-                        _trigger_type = "lead_lag"
-                        log_event("ALPHA", f"Lead-lag BUY_YES: global ${self.alpha.get_weighted_global_price():.2f} > strike ${strike:.2f} by ${diff:.2f} (edge {yes_edge}c)")
-                    elif signal == "BEARISH" and no_edge >= min_edge:
-                        alpha_override = "BUY_NO"
-                        _trigger_type = "lead_lag"
-                        log_event("ALPHA", f"Lead-lag BUY_NO: global ${self.alpha.get_weighted_global_price():.2f} < strike ${strike:.2f} by ${abs(diff):.2f} (edge {no_edge}c)")
-                    elif signal != "NEUTRAL":
-                        log_event("ALPHA", f"Lead-lag {signal} but no edge (YES:{yes_edge}c NO:{no_edge}c < {min_edge}c) — deferring to rules")
-
-                # Override 1: Front-Run (delta momentum — deviation from rolling baseline)
-                # Only fires if lead-lag didn't already trigger, and only with edge
-                if not alpha_override:
-                    yes_edge = dashboard.get("yes_edge", 0)
-                    no_edge = dashboard.get("no_edge", 0)
-                    min_edge = config.MIN_EDGE_CENTS
-                    if momentum > config.DELTA_THRESHOLD and yes_edge >= min_edge:
-                        alpha_override = "BUY_YES"
-                        _trigger_type = "momentum"
-                        log_event("ALPHA", f"Front-run BUY_YES: momentum={momentum:+.2f} > {config.DELTA_THRESHOLD} (edge {yes_edge}c)")
-                    elif momentum < -config.DELTA_THRESHOLD and no_edge >= min_edge:
-                        alpha_override = "BUY_NO"
-                        _trigger_type = "momentum"
-                        log_event("ALPHA", f"Front-run BUY_NO: momentum={momentum:+.2f} < -{config.DELTA_THRESHOLD} (edge {no_edge}c)")
+                yes_edge = dashboard.get("yes_edge", 0)
+                no_edge = dashboard.get("no_edge", 0)
+                min_edge = config.MIN_EDGE_CENTS
+                if delta > config.DELTA_THRESHOLD and yes_edge >= min_edge:
+                    alpha_override = "BUY_YES"
+                    _trigger_type = "front_run"
+                    log_event("ALPHA", f"Front-run BUY_YES: delta=${delta:+.2f} > {config.DELTA_THRESHOLD} (edge {yes_edge}c)")
+                elif delta < -config.DELTA_THRESHOLD and no_edge >= min_edge:
+                    alpha_override = "BUY_NO"
+                    _trigger_type = "front_run"
+                    log_event("ALPHA", f"Front-run BUY_NO: delta=${delta:+.2f} < -{config.DELTA_THRESHOLD} (edge {no_edge}c)")
 
                 # Override 2: Anchor Defense (near expiry + holding position)
                 if secs_left < config.ANCHOR_SECONDS_THRESHOLD and my_pos:
@@ -1775,11 +1750,11 @@ class TradingBot:
                     decision = {"decision": alpha_override, "confidence": 1.0,
                                 "reasoning": f"Alpha override: {alpha_override}"}
                 else:
-                    decision = self.agent.analyze_market(market_data, my_pos, alpha_monitor=self.alpha)
+                    decision = await self.agent.analyze_market(market_data, my_pos, alpha_monitor=self.alpha)
                 self.status["last_decision"] = decision
                 return
 
-            # 7. Alpha override or rule-based decision
+            # 7. Alpha override or agent decision
             if alpha_override:
                 action = alpha_override
                 confidence = 1.0
@@ -1791,7 +1766,7 @@ class TradingBot:
                     confidence=confidence, reasoning=reasoning, executed=True,
                 )
             else:
-                decision = self.agent.analyze_market(market_data, my_pos, alpha_monitor=self.alpha)
+                decision = await self.agent.analyze_market(market_data, my_pos, alpha_monitor=self.alpha)
                 self.status["last_decision"] = decision
 
                 action = decision["decision"]
@@ -1811,8 +1786,8 @@ class TradingBot:
                     self._current_market_max_conf = max(self._current_market_max_conf, confidence)
                 self._last_tracked_market = ticker
 
-                if action == "HOLD" or confidence < config.RULE_MIN_CONFIDENCE:
-                    self.status["last_action"] = f"Rules: {action} ({confidence:.0%})"
+                if action == "HOLD" or confidence < config.MIN_AGENT_CONFIDENCE:
+                    self.status["last_action"] = f"Agent: {action} ({confidence:.0%})"
                     return
 
             # 8. Execute — cancel any stale resting orders first to prevent accumulation
@@ -1855,8 +1830,8 @@ class TradingBot:
 
             # Entry pricing strategy based on signal urgency:
             # - Extreme momentum: cross spread immediately (market-take)
-            # - Alpha override (lead-lag/momentum/anchor): cross spread (time-sensitive edge)
-            # - Rule-based: midpoint of spread (balanced fill vs. price improvement)
+            # - Alpha override (front-run/anchor): cross spread (time-sensitive edge)
+            # - Agent-based: midpoint of spread (balanced fill vs. price improvement)
             extreme_momentum = (
                 self.alpha
                 and abs(self.alpha.delta_momentum) > config.EXTREME_DELTA_THRESHOLD

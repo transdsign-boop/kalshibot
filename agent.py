@@ -1,5 +1,4 @@
 import json
-import math
 import config
 from database import log_event, record_decision
 
@@ -10,9 +9,72 @@ except ImportError:
     HAS_ANTHROPIC = False
 
 
+TRADING_SYSTEM_PROMPT = """You are a disciplined BTC derivatives trader on Kalshi 15-minute binary options.
+
+Key rules:
+- Contracts pay $1 if BTC is above the strike at settlement (YES wins), $0 otherwise (NO wins)
+- You choose BUY_YES, BUY_NO, or HOLD with a confidence from 0.0 to 1.0
+- Only trade when mispricing exists: fair_value differs meaningfully from the market price
+- We trade trends, not reversals. Follow momentum when volatility is high.
+- Avoid contracts priced below 5c or above 85c (bad risk/reward on both sides)
+- Higher volatility = more uncertainty = fair value pulled toward 50c
+- Near expiry with BTC far from strike, the outcome becomes more certain — be aggressive on the winning side
+- Edge = fair_value - market_price. Positive edge on a side = buy opportunity on that side.
+- If both sides have edge, pick the one with more edge and trend confirmation
+- HOLD when there is no clear mispricing or when you are uncertain
+
+Always respond with valid JSON only — no markdown, no extra text:
+{"decision": "BUY_YES"|"BUY_NO"|"HOLD", "confidence": 0.0-1.0, "reasoning": "..."}"""
+
+
+def _build_trading_prompt(market_data: dict, current_position: dict | None,
+                          alpha_monitor=None) -> str:
+    """Build a rich user prompt with all available market data."""
+    parts = [f"Market data: {json.dumps(market_data, default=str)}"]
+
+    if current_position:
+        parts.append(f"Current position: {json.dumps(current_position, default=str)}")
+    else:
+        parts.append("Current position: None")
+
+    # Enrich with alpha engine data
+    if alpha_monitor:
+        strike = market_data.get("strike_price", 0)
+        secs_left = market_data.get("seconds_to_close", 0)
+
+        if strike and strike > 0:
+            fv = alpha_monitor.get_fair_value(strike, secs_left)
+            parts.append(f"Fair value analysis: {json.dumps(fv, default=str)}")
+
+            best_ask = market_data.get("best_ask", 100)
+            best_bid = market_data.get("best_bid", 0)
+            yes_edge = fv["fair_yes_cents"] - best_ask
+            no_edge = (100 - fv["fair_yes_cents"]) - (100 - best_bid)
+            parts.append(f"YES edge: {yes_edge:+d}c (fair {fv['fair_yes_cents']}c vs ask {best_ask}c)")
+            parts.append(f"NO edge: {no_edge:+d}c (fair {100 - fv['fair_yes_cents']}c vs cost {100 - best_bid}c)")
+
+        vol = alpha_monitor.get_volatility()
+        parts.append(f"Volatility: {json.dumps(vol, default=str)}")
+
+        vel = alpha_monitor.get_price_velocity()
+        parts.append(f"Price velocity: {json.dumps(vel, default=str)}")
+
+        # Latency delta
+        delta = getattr(alpha_monitor, 'latency_delta', None)
+        if delta is not None:
+            parts.append(f"Binance-Coinbase delta: ${delta:+.1f}")
+
+    parts.append(
+        "\nReturn valid JSON with exactly these keys:\n"
+        '{"decision": "BUY_YES"|"BUY_NO"|"HOLD", '
+        '"confidence": 0.0-1.0, '
+        '"reasoning": "..."}'
+    )
+    return "\n".join(parts)
+
+
 class MarketAgent:
     def __init__(self):
-        # Anthropic client is only needed for chat, not trading decisions
         self.client = None
         if HAS_ANTHROPIC and config.ANTHROPIC_API_KEY:
             self.client = anthropic.AsyncAnthropic(
@@ -22,180 +84,77 @@ class MarketAgent:
         self.last_decision: dict | None = None
 
     # ------------------------------------------------------------------
-    # Rule-based trading decision (replaces Claude API call)
+    # Claude AI trading decision
     # ------------------------------------------------------------------
 
-    def analyze_market(
+    async def analyze_market(
         self, market_data: dict, current_position: dict | None = None,
         alpha_monitor=None,
     ) -> dict:
-        """Rule-based trading decision using price history, volatility, and fair value.
+        """Call Claude Haiku to get a trading decision.
 
-        Evaluates 4 signal dimensions:
-        1. Edge — is the contract mispriced vs fair value?
-        2. Trend — is BTC price moving toward or away from strike?
-        3. Volatility — high vol = trend-follow, low vol = sit out
-        4. Time decay — conservative near expiry, aggressive with time
-
-        Returns dict with keys: decision, confidence, reasoning.
+        Sends enriched market data (fair value, volatility, velocity, edge)
+        and returns dict with keys: decision, confidence, reasoning.
+        Falls back to HOLD on any error.
         """
-        strike = market_data.get("strike_price", 0)
-        secs_left = market_data.get("seconds_to_close", 0)
-        best_bid = market_data.get("best_bid", 0)
-        best_ask = market_data.get("best_ask", 100)
+        if not self.client:
+            return self._hold("No Anthropic client — ANTHROPIC_API_KEY not set")
 
-        if not alpha_monitor or not strike or strike <= 0:
-            return self._hold("No strike price or alpha data available")
+        user_msg = _build_trading_prompt(market_data, current_position, alpha_monitor)
 
-        # 1. Fair value estimation
-        fv = alpha_monitor.get_fair_value(strike, secs_left)
-        fair_yes_cents = fv["fair_yes_cents"]
-        fair_yes_prob = fv["fair_yes_prob"]
-        btc_vs_strike = fv["btc_vs_strike"]
+        try:
+            response = await self.client.messages.create(
+                model="claude-3-5-haiku-latest",
+                max_tokens=300,
+                system=TRADING_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_msg}],
+                timeout=5.0,
+            )
+            raw = response.content[0].text.strip()
 
-        # 2. Volatility regime
-        vol = alpha_monitor.get_volatility()
-        regime = vol["regime"]
+            # Strip markdown fences if the model wraps them
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1]
+                raw = raw.rsplit("```", 1)[0]
+            result = json.loads(raw)
 
-        # 3. Price velocity / trend
-        velocity = alpha_monitor.get_price_velocity()
-        vel_1m = velocity["velocity_1m"]
-        dir_1m = velocity["direction_1m"]
-        change_1m = velocity["price_change_1m"]
+            # Validate expected keys
+            decision = result.get("decision", "HOLD")
+            if decision not in ("BUY_YES", "BUY_NO", "HOLD"):
+                decision = "HOLD"
 
-        # 4. Time decay factor — directional boost for winning side near expiry
-        # When BTC is far from strike and time is running out, the winning side
-        # should get MORE confident (time decay working in their favor), not less.
-        max_contract_secs = 900.0
-        raw_time_factor = min(1.0, max(0.0, secs_left / max_contract_secs))
+            confidence = float(result.get("confidence", 0.0))
+            confidence = max(0.0, min(1.0, confidence))
 
-        # How many "expected moves" is BTC from strike?
-        # Use reasonable floor for vol to avoid division issues when data is sparse
-        vol_dpm = vol["vol_dollar_per_min"] if vol["vol_dollar_per_min"] >= 50 else 200
-        expected_move = vol_dpm * math.sqrt(max(secs_left, 1) / 60)
-        distance_ratio = min(10.0, abs(btc_vs_strike) / max(expected_move, 50))
+            reasoning = result.get("reasoning", "No reasoning provided.")
 
-        # Compute directional time factors (aggressive settings)
-        if distance_ratio > 1.5:
-            # Outcome is near-certain — strong boost to winning side
-            winning_boost = 1.0 + (1.0 - raw_time_factor) * 0.75  # up to 1.75x near expiry
-            losing_factor = raw_time_factor * 0.3  # heavily penalize losing side
-        elif distance_ratio > 1.0:
-            # Likely outcome — moderate boost to winner
-            winning_boost = 1.0 + (1.0 - raw_time_factor) * 0.4  # up to 1.4x near expiry
-            losing_factor = raw_time_factor * 0.6
-        else:
-            # Too close to strike — both sides stay conservative
-            winning_boost = raw_time_factor
-            losing_factor = raw_time_factor
+            self.last_decision = {
+                "decision": decision,
+                "confidence": confidence,
+                "reasoning": reasoning,
+            }
 
-        # Assign based on which side is winning
-        if btc_vs_strike > 0:  # BTC above strike — YES is winning
-            yes_time_factor = winning_boost
-            no_time_factor = losing_factor
-        else:  # BTC below strike — NO is winning
-            yes_time_factor = losing_factor
-            no_time_factor = winning_boost
+            record_decision(
+                market_id=market_data.get("ticker"),
+                decision=decision,
+                confidence=confidence,
+                reasoning=reasoning,
+            )
+            log_event("AGENT", f"{decision} ({confidence:.0%}) — {reasoning[:200]}")
+            return self.last_decision
 
-        # Build reasoning trace
-        reasons = []
-        reasons.append(f"BTC {'above' if btc_vs_strike > 0 else 'below'} strike by ${abs(btc_vs_strike):.0f}")
-        reasons.append(f"Fair: {fair_yes_cents}c YES ({fair_yes_prob:.0%})")
-        reasons.append(f"Vol: {regime} (${vol['vol_dollar_per_min']:.1f}/min)")
-        reasons.append(f"Trend: ${change_1m:+.0f}/1m")
-        reasons.append(f"Time: {secs_left:.0f}s left (dist={distance_ratio:.1f}x, Y×{yes_time_factor:.2f}/N×{no_time_factor:.2f})")
+        except json.JSONDecodeError as exc:
+            log_event("ERROR", f"Agent returned invalid JSON: {exc}")
+        except Exception as exc:
+            log_event("ERROR", f"Agent error: {exc}")
 
-        # Low-vol sit-out
-        if config.RULE_SIT_OUT_LOW_VOL and regime == "low":
-            return self._hold(f"Low vol — sitting out. {'; '.join(reasons)}")
-
-        # Compute edge on each side
-        yes_cost = best_ask
-        no_cost = 100 - best_bid
-        yes_edge = fair_yes_cents - yes_cost
-        no_edge = (100 - fair_yes_cents) - no_cost
-
-        reasons.append(f"YES edge: {yes_edge:+d}c (fair {fair_yes_cents} vs ask {yes_cost})")
-        reasons.append(f"NO edge: {no_edge:+d}c (fair {100 - fair_yes_cents} vs cost {no_cost})")
-
-        min_edge = config.MIN_EDGE_CENTS
-
-        # Trend confirmation
-        trend_confirms_yes = dir_1m > 0
-        trend_confirms_no = dir_1m < 0
-
-        # High vol: relax edge, add trend bonus
-        if regime == "high":
-            min_edge = max(3, min_edge - 3)
-
-        # Score YES — edge/100 spreads confidence over a wider range
-        yes_score = 0.0
-        if yes_edge >= min_edge:
-            yes_score = yes_edge / 100.0
-            if trend_confirms_yes:
-                yes_score += 0.10
-                if regime == "high" and abs(vel_1m) > config.TREND_FOLLOW_VELOCITY:
-                    yes_score += 0.05
-            yes_score *= yes_time_factor
-
-        # Score NO
-        no_score = 0.0
-        if no_edge >= min_edge:
-            no_score = no_edge / 100.0
-            if trend_confirms_no:
-                no_score += 0.10
-                if regime == "high" and abs(vel_1m) > config.TREND_FOLLOW_VELOCITY:
-                    no_score += 0.05
-            no_score *= no_time_factor
-
-        # Pick the best side
-        decision = "HOLD"
-        confidence = 0.0
-
-        # Calculate potential confidence for both sides (even if no edge)
-        potential_yes_conf = min(0.95, 0.45 + max(0, yes_edge / 100.0) * yes_time_factor) if yes_edge > 0 else 0.0
-        potential_no_conf = min(0.95, 0.45 + max(0, no_edge / 100.0) * no_time_factor) if no_edge > 0 else 0.0
-        best_potential = max(potential_yes_conf, potential_no_conf)
-
-        if yes_score > no_score and yes_score > 0:
-            decision = "BUY_YES"
-            confidence = min(0.95, 0.45 + yes_score)
-            reasons.append(f"-> BUY YES (score {yes_score:.2f}, edge {yes_edge}c"
-                           + (", trend OK" if trend_confirms_yes else "") + ")")
-        elif no_score > yes_score and no_score > 0:
-            decision = "BUY_NO"
-            confidence = min(0.95, 0.45 + no_score)
-            reasons.append(f"-> BUY NO (score {no_score:.2f}, edge {no_edge}c"
-                           + (", trend OK" if trend_confirms_no else "") + ")")
-        else:
-            # No edge - show what confidence would be if there was edge
-            return self._hold(f"No edge. {'; '.join(reasons)}", confidence=best_potential)
-
-        # Confidence gate
-        if confidence < config.RULE_MIN_CONFIDENCE:
-            return self._hold(f"Low confidence {confidence:.0%}. {'; '.join(reasons)}", confidence=confidence)
-
-        reasoning = "; ".join(reasons)
-        self.last_decision = {
-            "decision": decision,
-            "confidence": confidence,
-            "reasoning": reasoning,
-        }
-
-        record_decision(
-            market_id=market_data.get("ticker"),
-            decision=decision,
-            confidence=confidence,
-            reasoning=reasoning,
-        )
-        log_event("RULES", f"{decision} ({confidence:.0%}) — {reasoning[:200]}")
-        return self.last_decision
+        return self._hold("Agent error — defaulting to HOLD.")
 
     def _hold(self, reasoning: str, confidence: float = 0.0) -> dict:
         """Return a HOLD decision with optional confidence score."""
         result = {"decision": "HOLD", "confidence": confidence, "reasoning": reasoning}
         self.last_decision = result
-        log_event("RULES", f"HOLD — {reasoning[:200]}")
+        log_event("AGENT", f"HOLD — {reasoning[:200]}")
         return result
 
     # ------------------------------------------------------------------
@@ -247,8 +206,8 @@ class MarketAgent:
             # Only include key config values
             key_config = {k: v.get("value") if isinstance(v, dict) else v
                          for k, v in config.items()
-                         if k in ["MIN_EDGE_CENTS", "RULE_MIN_CONFIDENCE", "VOL_HIGH_THRESHOLD",
-                                  "VOL_LOW_THRESHOLD", "LEAD_LAG_THRESHOLD", "DELTA_THRESHOLD"]}
+                         if k in ["MIN_EDGE_CENTS", "MIN_AGENT_CONFIDENCE", "VOL_HIGH_THRESHOLD",
+                                  "VOL_LOW_THRESHOLD", "DELTA_THRESHOLD"]}
             context_parts.append(f"KEY CONFIG:\n{json.dumps(key_config, indent=2)}")
 
         if self.last_decision:
@@ -263,22 +222,21 @@ Your role is to:
 2. Analyze trading performance and suggest improvements
 3. Recommend config adjustments based on observed patterns
 4. Explain why the bot is making certain decisions
-5. Help interpret alpha signals (momentum, volatility, lead-lag, fair value)
+5. Help interpret alpha signals (momentum, volatility, fair value)
 6. USE THE update_config TOOL when the user asks you to change settings
 
 Key concepts:
 - YES/NO are binary outcomes based on whether BTC price is above/below the strike at settlement
 - Edge = fair_value - market_price (positive edge means opportunity)
 - Volatility affects fair value calculation (higher vol = more uncertainty = prices closer to 50c)
-- Lead-lag signal detects when BTC moved but Kalshi hasn't repriced yet
 - Confidence threshold determines whether to trade
+- The trading agent (Claude Haiku) makes BUY_YES/BUY_NO/HOLD decisions each cycle
 
 Available config parameters you can change:
-- RULE_MIN_CONFIDENCE: Minimum confidence to trade (0.0-1.0, default 0.7)
-- MIN_EDGE_CENTS: Minimum edge in cents to trade (1-20, default 4)
+- MIN_AGENT_CONFIDENCE: Minimum confidence to trade (0.0-1.0, default 0.75)
+- MIN_EDGE_CENTS: Minimum edge in cents to trade (1-20, default 5)
 - VOL_HIGH_THRESHOLD: High volatility threshold $/min (50-2000, default 400)
 - VOL_LOW_THRESHOLD: Low volatility threshold $/min (20-1000, default 200)
-- LEAD_LAG_THRESHOLD: Lead-lag signal threshold $ (10-500, default 75)
 - DELTA_THRESHOLD: Momentum threshold for front-run (5-100, default 20)
 
 When asked to change settings, USE THE TOOL - don't just suggest changes. After changing, confirm what you changed."""
@@ -293,7 +251,7 @@ When asked to change settings, USE THE TOOL - don't just suggest changes. After 
                     "properties": {
                         "setting": {
                             "type": "string",
-                            "description": "The config key to update (e.g., RULE_MIN_CONFIDENCE, MIN_EDGE_CENTS)"
+                            "description": "The config key to update (e.g., MIN_AGENT_CONFIDENCE, MIN_EDGE_CENTS)"
                         },
                         "value": {
                             "type": "number",
