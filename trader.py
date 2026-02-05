@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 import config
 from agent import MarketAgent
-from database import init_db, log_event, record_trade, record_decision, record_snapshot, get_entry_snapshot, get_unsettled_entry, get_setting, set_setting, set_live_market_pnl, sync_market_trades_from_snapshots
+from database import init_db, log_event, record_trade, record_decision, record_snapshot, get_entry_snapshot, get_unsettled_entry, get_setting, set_setting, set_live_market_pnl, sync_market_trades_from_snapshots, clear_paper_trading_data
 
 
 def _load_private_key():
@@ -166,6 +166,8 @@ class TradingBot:
         self._start_balance = None
         self._start_exposure = 0.0
         self._save_paper_state()
+        # Clear all paper trading data from database (trades, snapshots, decisions)
+        clear_paper_trading_data()
         log_event("INFO", f"Paper trading reset — balance: ${config.PAPER_STARTING_BALANCE:.2f}")
 
     async def switch_environment(self, env: str):

@@ -742,3 +742,23 @@ def set_setting(key: str, value: str):
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+
+
+def clear_paper_trading_data():
+    """Delete all paper trading data from the database (trades, snapshots, decisions).
+
+    Only deletes records with [PAPER] prefix in market_id to preserve live trading data.
+    """
+    with get_db() as conn:
+        # Delete paper trades
+        deleted_trades = conn.execute("DELETE FROM trades WHERE market_id LIKE '[PAPER]%'").rowcount
+
+        # Delete paper trade snapshots
+        deleted_snapshots = conn.execute("DELETE FROM trade_snapshots WHERE market_id LIKE '[PAPER]%'").rowcount
+
+        # Delete paper agent decisions (optional - clear all since they're not market-specific)
+        # If you want to keep all decisions, comment out the next line
+        deleted_decisions = conn.execute("DELETE FROM agent_decisions WHERE market_id LIKE '[PAPER]%' OR market_id IS NULL").rowcount
+
+    # Log after transaction completes to avoid "database is locked" error
+    log_event("INFO", f"Cleared paper trading data: {deleted_trades} trades, {deleted_snapshots} snapshots, {deleted_decisions} decisions")
